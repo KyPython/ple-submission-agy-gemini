@@ -121,13 +121,14 @@ server: `mcp_{bridge}_shell` runs bash there (each call starts in {workdir}), `m
 
 How to work:
 - Read the whole instruction first, then inspect the files it points to before deciding anything.
+- For drawings, diagrams, CAD exports, and schematics (.png, .jpg, .pdf), use `mcp_{bridge}_read_file` which returns native visual images for inspection.
 - Work in small, verified steps. Run calculations with python3 in the container rather than by hand.
 - Deliverable Verification Guardrails:
   1. Identify every required deliverable path, filename, and format (e.g. .zip, .ifc, .dxf, .csv, reports) up front.
   2. Materialize valid initial deliverable files early so non-empty files exist if unexpected timeouts occur.
   3. Improve deliverables iteratively, validating syntax and format in-container with python3.
-  4. Mandatory Pre-Completion Verification: Before declaring completion, run shell commands (`ls -lh <path>`)
-     to verify each deliverable exists, has non-zero size, and that any archive (such as .zip) is valid and extractable.
+  4. Mandatory Pre-Completion Verification: Before declaring completion, run shell commands (`test -s <path>`)
+     to verify each deliverable exists and is non-zero in size, and verify archive integrity (`unzip -t <path>`).
 - You have about {minutes} minutes. Leave time to finish and verify all deliverables.
 - End with a short summary of what you delivered and where, the key results, and any assumptions you made.
 """
