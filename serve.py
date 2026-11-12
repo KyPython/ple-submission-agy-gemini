@@ -127,8 +127,7 @@ How to work:
   1. Identify every required deliverable path, filename, and format (e.g. .zip, .ifc, .dxf, .csv, reports) up front.
   2. Materialize valid initial deliverable files early so non-empty files exist if unexpected timeouts occur.
   3. Improve deliverables iteratively, validating syntax and format in-container with python3.
-  4. Mandatory Pre-Completion Verification: Before declaring completion, run shell commands (`test -s <path>`)
-     to verify each deliverable exists and is non-zero in size, and verify archive integrity (`unzip -t <path>`).
+  4. Mandatory Pre-Completion Verification: Before declaring completion, run shell commands (`test -s <path>` and `ls -lh <path>`) to verify each deliverable exists, has non-zero size, and verify archive integrity (`unzip -t <path>`).
 - You have about {minutes} minutes. Leave time to finish and verify all deliverables.
 - End with a short summary of what you delivered and where, the key results, and any assumptions you made.
 """
