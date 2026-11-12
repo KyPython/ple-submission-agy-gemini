@@ -2,7 +2,7 @@
 
 Runs [Antigravity CLI](https://antigravity.google/docs/cli/overview) (`agy`)
 headless as a harness using the Google-sponsored `google-cloud/gemini-4-argon`
-model with reasoning effort `high` and self-verifying deliverable guardrails.
+model.
 
 ## How it works
 
