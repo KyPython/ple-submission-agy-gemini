@@ -1,6 +1,6 @@
 # Tasks: Frontier (agy-gemini) Stage 1 Readiness and Boundary Hardening
 
-Spec ID: FRNT · Status: draft (AI-prepared by Antigravity; awaiting Ky review)
+Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 0: Pre-Implementation Empirical Container & Baseline Checks ($0 Offline)
 

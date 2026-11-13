@@ -1,7 +1,7 @@
 # Design: Frontier (agy-gemini) Stage 1 Readiness and Boundary Hardening
 
-Spec ID: FRNT · Status: draft (AI-prepared by Antigravity; awaiting Ky review)
-Author: Antigravity (drafted at Ky's direction during Kiro credit exhaustion; not yet approved by Ky).
+Spec ID: FRNT · Status: approved by Ky on 2026-11-13
+Author: Antigravity (drafted at Ky's direction during Kiro credit exhaustion; approved by Ky on 2026-11-13).
 
 ## Overview
 
