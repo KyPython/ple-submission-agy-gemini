@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import base64
 from concurrent import futures
+import inspect
 import json
 import os
 import posixpath
+import shlex
 import sys
 import threading
 import time
@@ -40,12 +42,26 @@ RELAY = os.environ.get("TASK_RELAY_URL", "")
 WORKDIR = os.environ.get("TASK_WORKDIR", "/")
 MAX_TEXT = 40_000
 MAX_IMAGE = 5 << 20
+MAX_PDF_PAGES = 5
+MAX_PDF_TOTAL_BYTES = 10 << 20
+PDF_DPI_STEPS = ((150, "png"), (100, "png"), (72, "png"), (72, "jpeg"))
 IMAGE_MAGIC = {
     b"\x89PNG": "image/png",
     b"\xff\xd8\xff": "image/jpeg",
     b"GIF8": "image/gif",
     b"RIFF": "image/webp",
 }
+_BINARY_MAGIC = (
+    (b"AC10", "AutoCAD DWG"),
+    (b"PK\x03\x04", "ZIP archive"),
+    (b"PK\x05\x06", "ZIP archive"),
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2 compound document"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"\x1f\x8b\x08", "gzip compressed"),
+    (b"SQLite format 3\x00", "SQLite database"),
+    (b"\x7fELF", "ELF executable"),
+    (b"glTF", "glTF binary"),
+)
 # the relay is local: skip any HTTP proxy
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # write_file and edit_file take turns, so concurrent edits cannot undo each
@@ -109,8 +125,10 @@ TOOLS = [
         "name": "read_file",
         "description": (
             "Read a file from the task container: text comes back with line"
-            " numbers, png/jpeg/gif/webp images come back as images. Use offset"
-            " and limit to page through long files."
+            " numbers, png/jpeg/gif/webp images come back as images, and PDF"
+            " files are rendered to page images (up to 5 pages per call; pass"
+            " pages like '1-3' or '2,4-5' for multi-page PDFs). Use offset and"
+            " limit to page through long text files."
         ),
         "inputSchema": _schema(
             {
@@ -122,6 +140,13 @@ TOOLS = [
                 "limit": {
                     "type": "integer",
                     "description": "number of lines (default 2000)",
+                },
+                "pages": {
+                    "type": "string",
+                    "description": (
+                        "1-based PDF page selection (e.g. '1-3' or '2,4-5';"
+                        f" default 1-{MAX_PDF_PAGES}, max {MAX_PDF_PAGES})"
+                    ),
                 },
             },
             ["path"],
@@ -322,21 +347,470 @@ def shell(command: str, timeout_sec: int = 600) -> list[dict[str, Any]]:
   )
 
 
+def parse_pages_spec(
+    pages: str | None,
+    total_pages: int | None = None,
+    max_pages: int = MAX_PDF_PAGES,
+) -> list[int]:
+  """Parses a 1-based PDF page spec (`'1-3'` or `'2,4-5'`) into page numbers."""
+  if total_pages is not None and total_pages < 1:
+    raise ValueError("PDF has no pages")
+  if pages is None:
+    end = max_pages if total_pages is None else min(total_pages, max_pages)
+    return list(range(1, end + 1))
+  spec = pages.strip()
+  if not spec:
+    raise ValueError("pages spec must not be empty")
+  selected: list[int] = []
+  seen: set[int] = set()
+  for part in spec.split(","):
+    token = part.strip()
+    if not token:
+      raise ValueError(f"invalid empty token in pages spec {pages!r}")
+    if "-" in token:
+      pieces = token.split("-")
+      if (
+          len(pieces) != 2
+          or not (pieces[0].isascii() and pieces[0].isdigit())
+          or not (pieces[1].isascii() and pieces[1].isdigit())
+      ):
+        raise ValueError(f"invalid page range {token!r}")
+      start, end = int(pieces[0]), int(pieces[1])
+      if start < 1 or start > end:
+        raise ValueError(f"invalid page range {token!r}")
+      if end - start + 1 > max_pages:
+        raise ValueError(f"requested range exceeds {max_pages}-page cap")
+      span = range(start, end + 1)
+    else:
+      if not (token.isascii() and token.isdigit()):
+        raise ValueError(f"invalid page number {token!r}")
+      num = int(token)
+      if num < 1:
+        raise ValueError(f"page numbers must be >= 1, got {num}")
+      span = (num,)
+    for num in span:
+      if total_pages is not None and num > total_pages:
+        raise ValueError(f"page {num} exceeds total_pages={total_pages}")
+      if num not in seen:
+        seen.add(num)
+        selected.append(num)
+      if len(selected) > max_pages:
+        raise ValueError(
+            f"requested pages exceed max {max_pages} pages per read_file call"
+        )
+  return selected
+
+
+_CONTAINER_PDF_SCRIPT = """
+from __future__ import annotations
+import glob, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
+
+path, spec = sys.argv[1], sys.argv[2]
+MAX_PDF_PAGES = int(sys.argv[3])
+max_img = int(sys.argv[4])
+max_total = int(sys.argv[5])
+dpi_steps = json.loads(sys.argv[6])
+
+__PARSE_PAGES_SOURCE__
+
+def fail(reason, detail, **extra):
+  payload = {"ok": False, "reason": reason, "detail": detail, **extra}
+  print(json.dumps(payload))
+
+try:
+  with open(path, "rb") as f:
+    sig = f.read(5)
+except OSError as exc:
+  fail("read_error", str(exc))
+  sys.exit(0)
+
+if sig != b"%PDF-":
+  fail("not_pdf", "missing %PDF- signature")
+  sys.exit(0)
+
+tools = {
+    "pdftoppm": shutil.which("pdftoppm"),
+    "mutool": shutil.which("mutool"),
+    "gs": shutil.which("gs"),
+    "pdfinfo": shutil.which("pdfinfo"),
+    "fitz": importlib.util.find_spec("fitz"),
+    "pypdfium2": importlib.util.find_spec("pypdfium2"),
+}
+if not any(tools[k] for k in ("pdftoppm", "mutool", "gs", "fitz", "pypdfium2")):
+  fail("no_renderer", "none of pdftoppm, mutool, gs, fitz, pypdfium2 found")
+  sys.exit(0)
+
+def count_pages():
+  last_err = ""
+  if tools["pdfinfo"]:
+    r = subprocess.run([tools["pdfinfo"], path], capture_output=True, text=True)
+    if r.returncode == 0:
+      m = re.search(r"^Pages:\\s+(\\d+)", r.stdout, re.M)
+      if m:
+        return int(m.group(1)), ""
+    last_err = (r.stderr or r.stdout or "").strip()
+    if any(k in last_err.lower() for k in ("password", "encrypt", "syntax", "damaged")):
+      return 0, last_err
+  if tools["fitz"]:
+    try:
+      import fitz
+      doc = fitz.open(path)
+      try:
+        if doc.needs_pass:
+          return 0, "PDF is encrypted and requires a password"
+        return len(doc), ""
+      finally:
+        doc.close()
+    except Exception as exc:
+      last_err = str(exc)
+  if tools["pypdfium2"]:
+    try:
+      import pypdfium2
+      pdf = pypdfium2.PdfDocument(path)
+      try:
+        return len(pdf), ""
+      finally:
+        pdf.close()
+    except Exception as exc:
+      last_err = str(exc)
+  if tools["mutool"]:
+    r = subprocess.run([tools["mutool"], "info", path], capture_output=True, text=True)
+    if r.returncode == 0:
+      m = re.search(r"Pages:\\s+(\\d+)", r.stdout)
+      if m:
+        return int(m.group(1)), ""
+    last_err = (r.stderr or r.stdout or "").strip()
+  counts, page_objs, saw_encrypt = [], 0, False
+  overlap = b""
+  with open(path, "rb") as f:
+    while True:
+      chunk = f.read(1 << 20)
+      if not chunk:
+        break
+      buf = overlap + chunk
+      if b"/Encrypt" in buf:
+        saw_encrypt = True
+      for m in re.finditer(rb"/Type\\s*/Pages\\b[^>]{0,512}?/Count\\s+(\\d+)", buf):
+        counts.append(int(m.group(1)))
+      page_objs += len(re.findall(rb"/Type\\s*/Page\\b(?!s)", chunk))
+      overlap = buf[-1024:]
+  if saw_encrypt and not counts and not page_objs:
+    return 0, "PDF is encrypted"
+  if counts:
+    return max(counts), ""
+  if page_objs:
+    return page_objs, ""
+  return 0, last_err or "unable to determine PDF page count"
+
+total_pages, err = count_pages()
+if total_pages < 1:
+  fail("corrupt_or_encrypted", err or "invalid or encrypted PDF")
+  sys.exit(0)
+
+try:
+  target_pages = parse_pages_spec(spec or None, total_pages=total_pages, max_pages=MAX_PDF_PAGES)
+except ValueError as exc:
+  fail("bad_pages", str(exc), total_pages=total_pages)
+  sys.exit(0)
+
+def render_with(renderer, dpi, fmt, tmpdir):
+  ext = "png" if fmt == "png" else "jpg"
+  mime = "image/png" if fmt == "png" else "image/jpeg"
+  out_files = []
+  for p in target_pages:
+    out_path = os.path.join(tmpdir, f"page_{p}.{ext}")
+    if renderer == "pdftoppm":
+      prefix = os.path.join(tmpdir, f"raw_{p}")
+      flag = "-png" if fmt == "png" else "-jpeg"
+      r = subprocess.run(
+          [tools["pdftoppm"], flag, "-r", str(dpi), "-f", str(p), "-l", str(p), path, prefix],
+          capture_output=True, text=True,
+      )
+      if r.returncode != 0:
+        return None, (r.stderr or r.stdout or "pdftoppm failed").strip()
+      matches = sorted(glob.glob(f"{prefix}-*.png") + glob.glob(f"{prefix}-*.jpg"))
+      if not matches:
+        return None, f"pdftoppm produced no output for page {p}"
+      shutil.move(matches[0], out_path)
+    elif renderer == "mutool":
+      r = subprocess.run(
+          [tools["mutool"], "draw", "-q", "-F", fmt, "-r", str(dpi), "-o", out_path, path, str(p)],
+          capture_output=True, text=True,
+      )
+      if r.returncode != 0 or not os.path.exists(out_path):
+        return None, (r.stderr or r.stdout or "mutool failed").strip()
+    elif renderer == "fitz":
+      import fitz
+      doc = fitz.open(path)
+      try:
+        if doc.needs_pass:
+          return None, "PDF is encrypted"
+        doc[p - 1].get_pixmap(dpi=dpi).save(out_path)
+      finally:
+        doc.close()
+    elif renderer == "pypdfium2":
+      import pypdfium2
+      pdf = pypdfium2.PdfDocument(path)
+      try:
+        pil = pdf[p - 1].render(scale=dpi / 72).to_pil()
+        pil.save(out_path, format="PNG" if fmt == "png" else "JPEG")
+      finally:
+        pdf.close()
+    elif renderer == "gs":
+      dev = "png16m" if fmt == "png" else "jpeg"
+      r = subprocess.run(
+          [tools["gs"], "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", f"-sDEVICE={dev}", f"-r{dpi}", f"-dFirstPage={p}", f"-dLastPage={p}", f"-sOutputFile={out_path}", path],
+          capture_output=True, text=True,
+      )
+      if r.returncode != 0 or not os.path.exists(out_path):
+        return None, (r.stderr or r.stdout or "gs failed").strip()
+    sz = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    if sz <= 0:
+      return None, f"{renderer} produced empty output for page {p}"
+    out_files.append({"page": p, "path": out_path, "mime": mime, "bytes": sz})
+  return out_files, ""
+
+order = [k for k in ("pdftoppm", "mutool", "fitz", "pypdfium2", "gs") if tools[k]]
+tmpdir = tempfile.mkdtemp(prefix="pdfview-", dir="/tmp" if os.path.isdir("/tmp") else None)
+last_err = ""
+rendered_too_large = None
+for dpi, fmt in dpi_steps:
+  for name in os.listdir(tmpdir):
+    try:
+      os.unlink(os.path.join(tmpdir, name))
+    except OSError:
+      pass
+  for renderer in order:
+    if renderer in ("fitz", "pypdfium2") and fmt == "jpeg" and tools["pdftoppm"]:
+      continue
+    try:
+      files, err = render_with(renderer, dpi, fmt, tmpdir)
+    except Exception as exc:
+      files, err = None, str(exc)
+    if not files:
+      last_err = err or f"{renderer} failed"
+      continue
+    max_sz = max(item["bytes"] for item in files)
+    tot_sz = sum(item["bytes"] for item in files)
+    if max_sz <= max_img and tot_sz <= max_total:
+      print(json.dumps({
+          "ok": True,
+          "tmpdir": tmpdir,
+          "total_pages": total_pages,
+          "rendered_pages": target_pages,
+          "dpi": dpi,
+          "renderer": renderer,
+          "files": files,
+      }))
+      sys.exit(0)
+    rendered_too_large = (dpi, fmt, max_sz, tot_sz)
+    break
+
+shutil.rmtree(tmpdir, ignore_errors=True)
+if rendered_too_large:
+  dpi, fmt, max_sz, tot_sz = rendered_too_large
+  fail("too_large", f"rendered {fmt} at {dpi} DPI exceeds byte limits (max_page={max_sz}, total={tot_sz})")
+else:
+  fail("corrupt_or_encrypted", last_err or "all renderers failed on PDF")
+""".strip()
+
+
+def _build_header_probe_command(path: str) -> str:
+  """Builds a lightweight container command that checks the first 16 bytes for %PDF-."""
+  script = (
+      "import json, sys; "
+      "d = open(sys.argv[1], 'rb').read(16); "
+      "print(json.dumps({'is_pdf': d.startswith(b'%PDF-')}))"
+  )
+  return f"python3 -c {shlex.quote(script)} {shlex.quote(path)}"
+
+
+def _build_pdf_render_command(path: str, pages: str | None = None) -> str:
+  """Builds an in-container python3 command that renders PDF pages into a temp dir."""
+  script = _CONTAINER_PDF_SCRIPT.replace(
+      "__PARSE_PAGES_SOURCE__", inspect.getsource(parse_pages_spec)
+  )
+  steps_json = json.dumps([list(step) for step in PDF_DPI_STEPS])
+  args = " ".join(
+      shlex.quote(str(x))
+      for x in (
+          path,
+          pages or "",
+          MAX_PDF_PAGES,
+          MAX_IMAGE,
+          MAX_PDF_TOTAL_BYTES,
+          steps_json,
+      )
+  )
+  missing = (
+      '{"ok":false,"reason":"no_renderer",'
+      '"detail":"python3 and PDF rasterizers not found"}'
+  )
+  return (
+      f"command -v python3 >/dev/null 2>&1 || {{ echo {shlex.quote(missing)};"
+      f" exit 0; }}; python3 -c {shlex.quote(script)} {args}"
+  )
+
+
+def _describe_binary(path: str, data: bytes) -> str:
+  """Returns an informative metadata summary + shell hint for non-PDF binaries."""
+  for magic, label in _BINARY_MAGIC:
+    if data.startswith(magic):
+      detail = label
+      if magic == b"AC10" and len(data) >= 6:
+        ver = data[:6].decode("ascii", "ignore")
+        if ver.isprintable():
+          detail = f"{label} ({ver})"
+      return (
+          f"{path} is a {detail} binary file of {len(data)} bytes; inspect or"
+          " convert it with shell commands"
+      )
+  return (
+      f"{path} is a binary file of {len(data)} bytes; inspect or convert it"
+      " with shell commands"
+  )
+
+
+def _format_pdf_error(path: str, meta: dict[str, Any]) -> list[dict[str, Any]]:
+  """Formats an actionable fallback message when PDF rasterization cannot complete."""
+  reason = meta.get("reason", "unknown")
+  detail = str(meta.get("detail") or "PDF inspection failed").strip()
+  total = meta.get("total_pages")
+  if reason == "bad_pages":
+    bounds = f"1-{total}" if total else "1+"
+    return text(
+        f"cannot render {path}: {detail}. Choose valid 1-based pages within"
+        f" {bounds} (max {MAX_PDF_PAGES} pages per call), or inspect with shell"
+        " tools (pdftotext, pdfinfo, mutool, pypdf)."
+    )
+  if reason == "no_renderer":
+    return text(
+        f"{path} is a PDF, but no rasterizer is installed ({detail}); inspect or"
+        " extract text/images using shell commands (pdftotext, pdfinfo, pypdf,"
+        " python3)."
+    )
+  return text(
+      f"cannot render PDF {path} ({reason}: {detail}); inspect or decrypt/"
+      "convert it using shell commands (qpdf, pdfinfo, pdftotext, mutool,"
+      " pypdf)."
+  )
+
+
+def _read_pdf(path: str, pages: str | None = None) -> list[dict[str, Any]]:
+  """Renders up to `MAX_PDF_PAGES` pages of a container PDF into MCP image blocks."""
+  if pages is not None:
+    try:
+      parse_pages_spec(pages, total_pages=None, max_pages=MAX_PDF_PAGES)
+    except ValueError as exc:
+      return _format_pdf_error(
+          path, {"reason": "bad_pages", "detail": str(exc)}
+      )
+
+  r = relay("exec", command=_build_pdf_render_command(path, pages), timeout_sec=120)
+  if not r.get("ok", True):
+    return _format_pdf_error(
+        path, {"reason": "exec_error", "detail": r.get("error") or "exec failed"}
+    )
+  out = (r.get("output") or "").strip()
+  try:
+    meta = json.loads(out)
+  except ValueError:
+    return _format_pdf_error(
+        path,
+        {
+            "reason": "corrupt_or_encrypted",
+            "detail": out or f"exit_code={r.get('exit_code')}",
+        },
+    )
+
+  tmpdir = meta.get("tmpdir")
+  if not meta.get("ok"):
+    return _format_pdf_error(path, meta)
+
+  try:
+    files = meta.get("files") or []
+    blocks: list[dict[str, Any]] = []
+    total_img_bytes = 0
+    for item in files:
+      img_bytes = read_bytes(item["path"])
+      if len(img_bytes) > MAX_IMAGE:
+        return _format_pdf_error(
+            path,
+            {
+                "reason": "too_large",
+                "detail": f"page {item.get('page')} is {len(img_bytes)} bytes",
+            },
+        )
+      total_img_bytes += len(img_bytes)
+      if total_img_bytes > MAX_PDF_TOTAL_BYTES:
+        return _format_pdf_error(
+            path,
+            {
+                "reason": "too_large",
+                "detail": "combined page images exceed MCP frame cap",
+            },
+        )
+      blocks.append({
+          "type": "image",
+          "data": base64.b64encode(img_bytes).decode(),
+          "mimeType": item.get("mime", "image/png"),
+      })
+    rendered = meta.get("rendered_pages") or [f.get("page") for f in files]
+    rendered_str = ",".join(str(p) for p in rendered)
+    blocks.append({
+        "type": "text",
+        "text": (
+            f"{path} (PDF: rendered pages [{rendered_str}] of"
+            f" {meta.get('total_pages')} total at {meta.get('dpi')} DPI via"
+            f" {meta.get('renderer')}; pass pages='...' to inspect other"
+            f" pages, max {MAX_PDF_PAGES} per call)"
+        ),
+    })
+    return blocks
+  finally:
+    if isinstance(tmpdir, str) and tmpdir.startswith("/tmp/pdfview-"):
+      try:
+        relay("exec", command=f"rm -rf {shlex.quote(tmpdir)}", timeout_sec=30)
+      except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
 def read_file(
-    path: str, offset: int = 1, limit: int = 2000
+    path: str, offset: int = 1, limit: int = 2000, pages: str | None = None
 ) -> list[dict[str, Any]]:
-  """Reads a text or image file from the task container.
+  """Reads a text, raster image, or PDF file from the task container.
 
   Args:
     path: Path to the file inside the task container.
     offset: 1-based starting line number for text files.
     limit: Maximum number of lines to return for text files.
+    pages: Optional 1-based page range string (`'1-3'`, `'2,4-5'`) for PDFs.
 
   Returns:
-    An MCP content list containing numbered text lines or base64 image data.
+    An MCP content list containing numbered text lines, base64 images, or
+    informative metadata for non-text binary files.
   """
   path = resolve(path)
-  data = read_bytes(path)
+  r = relay("read_file", path=path)
+  if not r.get("ok"):
+    raise ValueError(r.get("error") or f"could not read {path}")
+  if r.get("truncated"):
+    probe = relay(
+        "exec", command=_build_header_probe_command(path), timeout_sec=15
+    )
+    try:
+      is_pdf = bool(json.loads((probe.get("output") or "").strip()).get("is_pdf"))
+    except ValueError:
+      is_pdf = False
+    if is_pdf:
+      return _read_pdf(path, pages)
+    raise ValueError(
+        f"{path} is {r.get('size')} bytes, over the 10 MB a read returns; work"
+        " on it with shell"
+    )
+  data = base64.b64decode(r["content_b64"])
+  if data.startswith(b"%PDF-"):
+    return _read_pdf(path, pages)
   mime = next(
       (m for magic, m in IMAGE_MAGIC.items() if data.startswith(magic)), None
   )
@@ -355,10 +829,9 @@ def read_file(
         {"type": "text", "text": f"{path} ({mime}, {len(data)} bytes)"},
     ]
   if b"\x00" in data[:8192]:
-    return text(
-        f"{path} is a binary file of {len(data)} bytes; inspect or convert it"
-        " with shell commands"
-    )
+    return text(_describe_binary(path, data))
+  if pages is not None:
+    return text(f"{path} is a text file; pages only applies to PDF files")
   lines = data.decode("utf-8", "replace").splitlines()
   start = taskbridge.positive_int(offset, 1)
   if not lines:

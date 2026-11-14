@@ -23,9 +23,9 @@ Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 3: Multimodal PDF and Binary Drawing Inspection
 
-- [ ] 11. Extend `task_mcp.py` `TOOLS` schema (`read_file` optional `pages` parameter) and implement deterministic `%PDF-` detection (including PDFs exceeding the `10 MB` single-read limit) routing to in-container `_read_pdf()` via `relay("exec", ...)` + temp PNG retrieval via `read_bytes()` + temp cleanup (FRNT-4.1, FRNT-4.2, FRNT-4.3)
-- [ ] 12. Implement `MAX_PDF_PAGES` (default `5`), explicit `pages` parsing, deterministic DPI/format downscaling to stay within `MAX_IMAGE` (`5 MiB`) and `MAX_FRAME` (`16 MiB`), and graceful actionable fallback messages when renderers are missing or PDFs are corrupt/encrypted/out-of-range (FRNT-4.2, FRNT-4.3, FRNT-4.4)
-- [ ] 13. Preserve exact `IMAGE_MAGIC` (`PNG`/`JPEG`/`GIF`/`WEBP`) and NUL-free text/ASCII CAD behavior while enhancing non-PDF binary detection (`.dwg`, `.rvt`, `.zip`, etc.) to return deterministic format/size metadata and `shell` inspection hints (FRNT-4.5, FRNT-4.6)
+- [x] 11. Extend `task_mcp.py` `TOOLS` schema (`read_file` optional `pages` parameter) and implement deterministic `%PDF-` detection (including PDFs exceeding the `10 MB` single-read limit) routing to in-container `_read_pdf()` via `relay("exec", ...)` + temp PNG retrieval via `read_bytes()` + temp cleanup (FRNT-4.1, FRNT-4.2, FRNT-4.3) — *Done*
+- [x] 12. Implement `MAX_PDF_PAGES` (default `5`), explicit `pages` parsing, deterministic DPI/format downscaling to stay within `MAX_IMAGE` (`5 MiB`) and `MAX_FRAME` (`16 MiB`), and graceful actionable fallback messages when renderers are missing or PDFs are corrupt/encrypted/out-of-range (FRNT-4.2, FRNT-4.3, FRNT-4.4) — *Done*
+- [x] 13. Preserve exact `IMAGE_MAGIC` (`PNG`/`JPEG`/`GIF`/`WEBP`) and NUL-free text/ASCII CAD behavior while enhancing non-PDF binary detection (`.dwg`, `.rvt`, `.zip`, etc.) to return deterministic format/size metadata and `shell` inspection hints (FRNT-4.5, FRNT-4.6) — *Done*
 
 ## Phase 4: Programmatic Deliverable Verification Gate
 
@@ -34,7 +34,7 @@ Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 5: Offline $0 Test Suite & Stage 1 Readiness Verification
 
-- [ ] 16. Write and run offline `$0` boundary tests in `tests/test_permissions_boundary.py` covering positive authorized MCP flows and negative escape, invalid-arg, bad-URL, secret-redaction, policy-fail-closed, and MCP tool-scoping checks (FRNT-1.1, FRNT-1.2, FRNT-1.3, FRNT-1.4, FRNT-1.5, FRNT-2.1, FRNT-2.2, FRNT-2.3, FRNT-2.4, FRNT-2.5, FRNT-3.1, FRNT-3.2, FRNT-3.3, FRNT-3.4)
-- [ ] 17. Write and run offline `$0` PDF and drawing inspection tests in `tests/test_pdf_inspection.py` covering multi-page rendering, >10 MB PDFs, DPI downscaling, missing renderer/corrupt PDF fallbacks, `IMAGE_MAGIC` regressions, and binary CAD metadata summaries (FRNT-4.1, FRNT-4.2, FRNT-4.3, FRNT-4.4, FRNT-4.5, FRNT-4.6)
+- [x] 16. Write and run offline `$0` boundary tests in `tests/test_permissions_boundary.py` covering positive authorized MCP flows and negative escape, invalid-arg, bad-URL, secret-redaction, policy-fail-closed, and MCP tool-scoping checks (FRNT-1.1, FRNT-1.2, FRNT-1.3, FRNT-1.4, FRNT-1.5, FRNT-2.1, FRNT-2.2, FRNT-2.3, FRNT-2.4, FRNT-2.5, FRNT-3.1, FRNT-3.2, FRNT-3.3, FRNT-3.4) — *Done (14/14 passing)*
+- [x] 17. Write and run offline `$0` PDF and drawing inspection tests in `tests/test_pdf_inspection.py` covering multi-page rendering, >10 MB PDFs, DPI downscaling, missing renderer/corrupt PDF fallbacks, `IMAGE_MAGIC` regressions, and binary CAD metadata summaries (FRNT-4.1, FRNT-4.2, FRNT-4.3, FRNT-4.4, FRNT-4.5, FRNT-4.6) — *Done (6/6 passing)*
 - [ ] 18. Write and run offline `$0` verification gate tests in `tests/test_deliverable_gate.py` covering candidate discovery, format checks, bounded `--conversation` repair trigger, exhaustion/low-budget exit, and cancellation safety (FRNT-5.1, FRNT-5.2, FRNT-5.3, FRNT-5.4)
 - [ ] 19. Write and run offline `$0` packaging tests in `tests/test_stage1_packaging.py` plus `uv run python -m kit validate .` and `scripts/check_submission.sh` with `scripts/mock_proxy.py` (no paid API calls) and verify final bundle size `< 2 GiB` (`<= 512 MiB` target) (FRNT-6.1, FRNT-6.2, FRNT-6.3, FRNT-6.4, FRNT-6.5)
