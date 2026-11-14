@@ -27,11 +27,13 @@ import inspect
 import json
 import os
 import posixpath
+import re
 import shlex
 import sys
 import threading
 import time
 from typing import Any
+import urllib.parse
 import urllib.request
 
 # taskbridge.py sits beside this file, a folder python -I leaves off sys.path.
@@ -69,12 +71,30 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _files = threading.Lock()
 _err_lock = threading.Lock()
 _CAPTURED_SECRETS: list[str] = []
+_PDF_TMPDIR_RE = re.compile(r"/tmp/pdfview-[A-Za-z0-9._-]+")
 
 
 def _extra_secrets() -> tuple[str, ...]:
-  """Returns relay and scrubbed process secret values for redaction."""
-  vals = [RELAY, os.environ.get("TASK_RELAY_URL", ""), *_CAPTURED_SECRETS]
-  return tuple(v for v in vals if v)
+  """Returns relay URLs, bare relay tokens, and scrubbed process secrets."""
+  vals: list[str] = []
+  for url in (RELAY, os.environ.get("TASK_RELAY_URL", "")):
+    if not url:
+      continue
+    vals.append(url)
+    path_token = urllib.parse.urlsplit(url).path.strip("/").split("/")[0]
+    if len(path_token) >= 4:
+      vals.append(path_token)
+  vals.extend(_CAPTURED_SECRETS)
+  return tuple(dict.fromkeys(v for v in vals if v))
+
+
+def _enforce_frame_limit(label: str, body: bytes) -> None:
+  """Raises ValueError if a command payload approaches taskbridge.MAX_FRAME."""
+  if len(body) > taskbridge.MAX_FRAME - 1024:
+    raise ValueError(
+        f"{label}: payload {len(body)} bytes approaches MAX_FRAME"
+        f" ({taskbridge.MAX_FRAME}); write a script with write_file instead"
+    )
 
 
 def _scrub_process_env() -> None:
@@ -201,11 +221,8 @@ def relay(route: str, **fields: Any) -> dict[str, Any]:
         f"{route}: request body is {len(body)} bytes, over MAX_BODY"
         f" ({taskbridge.MAX_BODY})"
     )
-  if route == "exec" and len(body) > taskbridge.MAX_FRAME - 1024:
-    raise ValueError(
-        f"exec: payload {len(body)} bytes approaches MAX_FRAME"
-        f" ({taskbridge.MAX_FRAME}); write a script with write_file instead"
-    )
+  if route == "exec":
+    _enforce_frame_limit("exec", body)
   req = urllib.request.Request(
       f"{relay_url}/{route}",
       data=body,
@@ -329,10 +346,7 @@ def shell(command: str, timeout_sec: int = 600) -> list[dict[str, Any]]:
   probe = json.dumps(
       {"command": command, "timeout_sec": bounded_timeout}
   ).encode("utf-8")
-  if len(probe) > taskbridge.MAX_FRAME - 1024:
-    raise ValueError(
-        f"shell command payload ({len(probe)} bytes) exceeds MAX_FRAME limit"
-    )
+  _enforce_frame_limit("shell command", probe)
   r = relay(
       "exec",
       command=command,
@@ -616,13 +630,23 @@ else:
 
 
 def _build_header_probe_command(path: str) -> str:
-  """Builds a lightweight container command that checks the first 16 bytes for %PDF-."""
+  """Builds a lightweight container command checking the file header for %PDF-."""
   script = (
       "import json, sys; "
       "d = open(sys.argv[1], 'rb').read(16); "
       "print(json.dumps({'is_pdf': d.startswith(b'%PDF-')}))"
   )
-  return f"python3 -c {shlex.quote(script)} {shlex.quote(path)}"
+  qp = shlex.quote(path)
+  fallback = (
+      f"if [ \"$(head -c 5 {qp} 2>/dev/null | LC_ALL=C tr -d '\\000')\" ="
+      " '%PDF-' ]; then echo '{\"is_pdf\":true}'; else echo"
+      " '{\"is_pdf\":false}'; fi"
+  )
+  return (
+      "if command -v python3 >/dev/null 2>&1; then "
+      f"python3 -c {shlex.quote(script)} {qp}; "
+      f"else {fallback}; fi"
+  )
 
 
 def _build_pdf_render_command(path: str, pages: str | None = None) -> str:
@@ -706,28 +730,36 @@ def _read_pdf(path: str, pages: str | None = None) -> list[dict[str, Any]]:
           path, {"reason": "bad_pages", "detail": str(exc)}
       )
 
-  r = relay("exec", command=_build_pdf_render_command(path, pages), timeout_sec=120)
-  if not r.get("ok", True):
-    return _format_pdf_error(
-        path, {"reason": "exec_error", "detail": r.get("error") or "exec failed"}
-    )
-  out = (r.get("output") or "").strip()
+  tmpdir: str | None = None
   try:
-    meta = json.loads(out)
-  except ValueError:
-    return _format_pdf_error(
-        path,
-        {
-            "reason": "corrupt_or_encrypted",
-            "detail": out or f"exit_code={r.get('exit_code')}",
-        },
+    r = relay(
+        "exec", command=_build_pdf_render_command(path, pages), timeout_sec=120
     )
+    out = (r.get("output") or "").strip()
+    m_tmp = _PDF_TMPDIR_RE.search(out)
+    if m_tmp:
+      tmpdir = m_tmp.group(0)
+    if not r.get("ok", True):
+      err = str(r.get("error") or "exec failed")
+      if not tmpdir:
+        m_err = _PDF_TMPDIR_RE.search(err)
+        if m_err:
+          tmpdir = m_err.group(0)
+      return _format_pdf_error(path, {"reason": "exec_error", "detail": err})
+    meta = taskbridge.parse_last_json_dict(out)
+    if meta is None:
+      return _format_pdf_error(
+          path,
+          {
+              "reason": "corrupt_or_encrypted",
+              "detail": out or f"exit_code={r.get('exit_code')}",
+          },
+      )
+    if isinstance(meta.get("tmpdir"), str):
+      tmpdir = meta["tmpdir"]
+    if not meta.get("ok"):
+      return _format_pdf_error(path, meta)
 
-  tmpdir = meta.get("tmpdir")
-  if not meta.get("ok"):
-    return _format_pdf_error(path, meta)
-
-  try:
     files = meta.get("files") or []
     blocks: list[dict[str, Any]] = []
     total_img_bytes = 0
@@ -798,10 +830,8 @@ def read_file(
     probe = relay(
         "exec", command=_build_header_probe_command(path), timeout_sec=15
     )
-    try:
-      is_pdf = bool(json.loads((probe.get("output") or "").strip()).get("is_pdf"))
-    except ValueError:
-      is_pdf = False
+    probe_meta = taskbridge.parse_last_json_dict(probe.get("output") or "")
+    is_pdf = bool(probe_meta and probe_meta.get("is_pdf"))
     if is_pdf:
       return _read_pdf(path, pages)
     raise ValueError(
@@ -912,8 +942,14 @@ _TOOL_SCHEMAS = {t["name"]: t["inputSchema"] for t in TOOLS}
 _out = threading.Lock()
 
 
-def _validate_str(key: str, val: Any, *, allow_empty: bool = False) -> str:
-  """Validates string fields for UTF-8 safety, optional non-emptiness, and NUL."""
+def _validate_str(
+    key: str,
+    val: Any,
+    *,
+    allow_empty: bool = False,
+    allow_whitespace: bool = False,
+) -> str:
+  """Validates string fields for UTF-8 safety, NUL, and emptiness."""
   if not isinstance(val, str):
     raise ValueError(f"{key} must be a string")
   if "\x00" in val and not allow_empty:
@@ -922,7 +958,7 @@ def _validate_str(key: str, val: Any, *, allow_empty: bool = False) -> str:
     val.encode("utf-8")
   except UnicodeEncodeError:
     raise ValueError(f"{key} contains unpaired UTF-16 surrogates") from None
-  if not allow_empty and not val.strip():
+  if not allow_empty and (not val or (not allow_whitespace and not val.strip())):
     raise ValueError(f"{key} must be a non-empty string")
   return val
 
@@ -962,9 +998,12 @@ def validate_tool_args(name: Any, args: Any) -> dict[str, Any]:
     spec_type = (props.get(key) or {}).get("type")
     if spec_type == "string":
       allow_empty = key in ("content", "new_text")
-      cleaned[key] = _validate_str(key, val, allow_empty=allow_empty)
-      if key == "old_text" and not cleaned[key]:
-        raise ValueError("old_text must not be empty")
+      cleaned[key] = _validate_str(
+          key,
+          val,
+          allow_empty=allow_empty,
+          allow_whitespace=(key == "old_text"),
+      )
     elif spec_type == "integer":
       cleaned[key] = _validate_pos_int(key, val)
     elif spec_type == "boolean":

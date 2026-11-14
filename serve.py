@@ -60,9 +60,20 @@ MAX_RUNS = 4
 BACKOFF_SEC = 60
 # bytes; Linux refuses one argument over 128 KiB (MAX_ARG_STRLEN)
 MAX_ARGV_PROMPT = 100_000
-MAX_EAGER_EXTERNAL_MCP_TOOLS = max(
-    0, int(os.environ.get("AGY_MAX_EAGER_MCP_TOOLS") or "8")
-)
+
+
+def _get_eager_mcp_budget(default: int = 8) -> int:
+  """Parses `AGY_MAX_EAGER_MCP_TOOLS`, falling back cleanly on empty/invalid values."""
+  raw = (os.environ.get("AGY_MAX_EAGER_MCP_TOOLS") or "").strip()
+  if not raw:
+    return default
+  try:
+    return max(0, int(raw))
+  except ValueError:
+    return default
+
+
+MAX_EAGER_EXTERNAL_MCP_TOOLS = _get_eager_mcp_budget(8)
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _POLICY_ERROR_RE = re.compile(
@@ -531,14 +542,13 @@ async def configure(
   }
   allow_patterns = _parse_patterns("AGY_MCP_TOOL_ALLOWLIST")
   deny_patterns = _parse_patterns("AGY_MCP_TOOL_DENYLIST")
-  max_eager_raw = os.environ.get("AGY_MAX_EAGER_MCP_TOOLS")
-  max_eager = (
-      max(0, int(max_eager_raw))
-      if max_eager_raw is not None and max_eager_raw.strip()
-      else MAX_EAGER_EXTERNAL_MCP_TOOLS
-  )
-  eager_remaining = max_eager
+  eager_remaining = _get_eager_mcp_budget(MAX_EAGER_EXTERNAL_MCP_TOOLS)
   seen_servers: set[str] = {bridge}
+  for server in session.mcp_servers:
+    sname = server.get("name")
+    if isinstance(sname, str) and sname != bridge:
+      # Fail closed for every declared task server until discovery succeeds.
+      relay.set_mcp_policy(sname, set())
   apps = []
   for server in session.mcp_servers:
     raw_name = server.get("name")
@@ -719,7 +729,7 @@ async def _run_agy_turn(
       )
       if part
   )
-  if finished and finished.code != 0 and _POLICY_ERROR_RE.search(policy_text):
+  if _POLICY_ERROR_RE.search(policy_text):
     msg = (
         "policy error: agy rejected policy configuration"
         f" ({policy_text[:200]})"
@@ -787,7 +797,8 @@ async def _run_verification_and_repair(
         f"{deliverable_gate.MAX_REPAIR_ATTEMPTS}"
     )
     repair_prompt = deliverable_gate.build_repair_prompt(report)
-    _, _, _, conversation = await _run_agy_turn(
+    prev_final = session.final_message
+    _, rep_run, _, conversation = await _run_agy_turn(
         session,
         relay,
         home,
@@ -796,6 +807,10 @@ async def _run_verification_and_repair(
         run_index=len(runs),
         runs=runs,
     )
+    if rep_run.get("status") in ("ERROR", "CANCELLED") and not rep_run.get(
+        "response"
+    ):
+      session.final_message = prev_final
     if session.cancelled.is_set():
       break
     report = await run_check()

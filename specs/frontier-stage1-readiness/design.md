@@ -185,7 +185,7 @@ Phase 0 probes ran offline (`$0`, `--network none`, local `127.0.0.1` mock Gemin
 
 ## Testing strategy (criterion ID -> test file)
 
-All tests execute **100% offline at `$0` cost** using Python `unittest`/`pytest`, mocked `taskbridge.Session`/`Relay`, local loopback servers, and `scripts/mock_proxy.py` — zero Vertex AI or commercial LLM calls.
+All tests execute **100% offline at `$0` cost** using Python `unittest`/`pytest`, mocked `taskbridge.Session`/`Relay`, local loopback servers, and `../scripts/mock_proxy.py` — zero Vertex AI or commercial LLM calls.
 
 | Criterion | Test |
 | --- | --- |

@@ -240,6 +240,25 @@ class PermissionBoundaryTests(unittest.TestCase):
           f"expected structured policy error in session.logs, got {session.logs}",
       )
 
+      # Even rc=0 headless auto-denial / mode warning must fail closed
+      rc0_session = FakeSession()
+      with tempfile.TemporaryDirectory() as tmp2:
+        fake_rc0 = pathlib.Path(tmp2) / "fake_rc0.sh"
+        fake_rc0.write_text(
+            "#!/bin/sh\n"
+            'echo "the tool required approval that headless mode cannot prompt for, so they were auto-denied." >&2\n'
+            'echo \'{"event":"init","conversation_id":"c-rc0"}\'\n'
+            'echo \'{"event":"result","result":{"status":"OK","response":"done"}}\'\n'
+            "exit 0\n"
+        )
+        fake_rc0.chmod(fake_rc0.stat().st_mode | stat.S_IEXEC)
+        with (
+            mock.patch.object(serve, "AGY", str(fake_rc0)),
+            mock.patch.dict(os.environ, {"HOME": tmp2, "MODEL_NAME": "gemini-4-argon"}),
+        ):
+          with self.assertRaises(RuntimeError):
+            await serve.solve(rc0_session)
+
     asyncio.run(run_fail_closed())
 
   def test_headless_engineering_shell_commands_allowed(self) -> None:
@@ -480,6 +499,24 @@ class PermissionBoundaryTests(unittest.TestCase):
     query_server = [{"name": "q", "url": "http://127.0.0.1:8000/mcp?token=abc"}]
     self.assertTrue(taskbridge.mcp_allows("http://127.0.0.1:8000/mcp?token=abc", query_server))
     self.assertFalse(taskbridge.mcp_allows("http://127.0.0.1:8000/mcp?token=abc&x=1", query_server))
+    self.assertFalse(
+        taskbridge.mcp_allows(
+            "http://127.0.0.1:8000/mcp?token=abc#frag", query_server
+        )
+    )
+    frag_server = [
+        {"name": "f", "url": "https://api.example.com/mcp?session=1#frag"}
+    ]
+    self.assertTrue(
+        taskbridge.mcp_allows(
+            "https://api.example.com/mcp?session=1#frag", frag_server
+        )
+    )
+    self.assertFalse(
+        taskbridge.mcp_allows(
+            "https://api.example.com:443/mcp?session=1#frag", frag_server
+        )
+    )
 
   def test_secret_isolation_and_error_redaction(self) -> None:
     """FRNT-2.4: mcp_config.json strips keys and redact_secrets scrubs tokens/keys."""
@@ -528,6 +565,20 @@ class PermissionBoundaryTests(unittest.TestCase):
     # _scrub_process_env pops sensitive keys from child env while keeping redaction active
     with mock.patch.dict(os.environ, {"GEMINI_API_KEY": secret_key}, clear=False):
       task_mcp._scrub_process_env()
+      self.assertNotIn("GEMINI_API_KEY", os.environ)
+      err_out: list[dict] = []
+      with (
+          mock.patch.object(task_mcp, "RELAY", relay_url),
+          mock.patch.object(task_mcp, "send", side_effect=err_out.append),
+          mock.patch.object(task_mcp, "relay", side_effect=RuntimeError(f"boom GET /{relay_tok}/exec key={secret_key}")),
+      ):
+        task_mcp.call(1, {"name": "read_file", "arguments": {"path": "/app/x.txt"}})
+      scrub_txt = err_out[0]["result"]["content"][0]["text"]
+      self.assertNotIn(secret_key, scrub_txt)
+      self.assertNotIn(relay_tok, scrub_txt)
+      # Allow whitespace-only old_text in edit_file
+      cleaned = task_mcp.validate_tool_args("edit_file", {"path": "/app/x.txt", "old_text": "    \n", "new_text": ""})
+      self.assertEqual(cleaned["old_text"], "    \n")
       self.assertNotIn("GEMINI_API_KEY", os.environ)
       self.assertNotIn(secret_key, taskbridge.redact_secrets(f"err {secret_key}", extra_secrets=task_mcp._extra_secrets()))
 
@@ -668,6 +719,51 @@ class PermissionBoundaryTests(unittest.TestCase):
         any("registered" in log and "filtered" in log and "deferred" in log for log in session.logs),
         session.logs,
     )
+
+    # SSE tools/list filtering AND skipped/failed MCP server fail-closed checks
+    sse_body = (
+        "event: message\r\n"
+        + "data: "
+        + json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {"name": "inspect_part", "description": "ok"},
+                    {"name": "delete_database", "description": "blocked"},
+                ]
+            },
+        })
+        + "\r\n\r\n"
+    ).encode("utf-8")
+    filtered_sse = taskbridge._filter_tools_list_body(sse_body, {"inspect_part"}).decode("utf-8")
+    self.assertIn("inspect_part", filtered_sse)
+    self.assertNotIn("delete_database", filtered_sse)
+
+    # Skipped server (e.g. failed tools/list or disallowed URL) must fail closed in Relay._mcp
+    async def run_skipped_server() -> None:
+      s2 = FakeSession(mcp_servers=[
+          {"name": "broken_srv", "url": "http://127.0.0.1:8000/broken"},
+          {"name": "bad_url", "url": "file:///etc/passwd"},
+      ])
+      with (
+          tempfile.TemporaryDirectory() as tmp2,
+          mock.patch.object(serve, "mcp_tools", side_effect=RuntimeError("offline")),
+      ):
+        async with taskbridge.Relay(s2) as r2:
+          await serve.configure(s2, r2, pathlib.Path(tmp2))
+          call_req = json.dumps({
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "tools/call",
+              "params": {"name": "any_tool", "arguments": {}},
+          }).encode()
+          st_broken, _ = await _relay_post(r2, "mcp/broken_srv/", call_req)
+          st_bad, _ = await _relay_post(r2, "mcp/bad_url/", call_req)
+          self.assertEqual(st_broken, 403)
+          self.assertEqual(st_bad, 403)
+
+    asyncio.run(run_skipped_server())
 
 
 if __name__ == "__main__":

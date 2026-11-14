@@ -183,6 +183,7 @@ class DeliverableGateTests(unittest.TestCase):
         return taskbridge.Finished(code=0, stderr="")
 
       with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
           mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
           mock.patch.object(taskbridge, "run_process", side_effect=fake_run_process),
       ):
@@ -292,6 +293,7 @@ class DeliverableGateTests(unittest.TestCase):
         return taskbridge.Finished(code=0, stderr="")
 
       with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
           mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
           mock.patch.object(taskbridge, "run_process", side_effect=fake_run_process),
       ):
@@ -340,6 +342,7 @@ class DeliverableGateTests(unittest.TestCase):
         return taskbridge.Finished(code=0, stderr="")
 
       with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
           mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
           mock.patch.object(taskbridge, "run_process", side_effect=always_broken),
       ):
@@ -374,6 +377,7 @@ class DeliverableGateTests(unittest.TestCase):
         return taskbridge.Finished(code=0, stderr="")
 
       with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
           mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
           mock.patch.object(taskbridge, "run_process", side_effect=low_budget_run),
       ):
@@ -401,6 +405,7 @@ class DeliverableGateTests(unittest.TestCase):
         return taskbridge.Finished(code=0, stderr="")
 
       with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
           mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
           mock.patch.object(taskbridge, "run_process", side_effect=cancel_run),
       ):
@@ -409,6 +414,121 @@ class DeliverableGateTests(unittest.TestCase):
     self.assertEqual(cancel_calls, 1)
     cancel_summary = [json.loads(l) for l in session.logs if '"deliverable_verification"' in l][-1]
     self.assertFalse(cancel_summary["repair_triggered"])
+
+    # 4) Failed repair turn with partial text does NOT overwrite valid Turn-0 final_message
+    with tempfile.TemporaryDirectory() as workdir:
+      target = pathlib.Path(workdir) / "out.json"
+      session = LocalContainerSession(
+          workdir=workdir,
+          instruction=f"Write {target}.",
+          time_left_sec=1800.0,
+      )
+      fake_relay = FakeRelay(session)
+      err_calls = 0
+
+      async def good_then_crashed_repair(argv, sess, *, env, cwd, stdin, stop_before_sec, log_prefix):
+        nonlocal err_calls
+        err_calls += 1
+        target.write_text("{bad json")
+        if err_calls == 1:
+          pathlib.Path(env["AGY_STREAM"]).write_text(
+              _stream_lines("conv-preserve", "Complete Turn 0 Answer."),
+              encoding="utf-8",
+          )
+        else:
+          pathlib.Path(env["AGY_STREAM"]).write_text(
+              "\n".join([
+                  json.dumps({"event": "init", "conversation_id": "conv-preserve"}),
+                  json.dumps({
+                      "event": "step",
+                      "step_update": {
+                          "step_index": 0,
+                          "step_type": "agent_response",
+                          "text_delta": "Starting repair fragment...",
+                          "state": "ACTIVE",
+                      },
+                  }),
+                  json.dumps({"event": "result", "result": {"status": "ERROR", "error": "transient error"}}),
+              ]) + "\n",
+              encoding="utf-8",
+          )
+        return taskbridge.Finished(code=1, stderr="")
+
+      with (
+          mock.patch.dict(os.environ, {"HOME": workdir}),
+          mock.patch.object(taskbridge, "Relay", return_value=fake_relay),
+          mock.patch.object(taskbridge, "run_process", side_effect=good_then_crashed_repair),
+      ):
+        preserved = asyncio.run(serve.solve(session))
+    self.assertEqual(preserved, "Complete Turn 0 Answer.")
+
+    # 5) POSIX fallback (no python3 on PATH) handles backslash filenames + unreadable files cleanly
+    import shutil
+    with tempfile.TemporaryDirectory() as workdir:
+      root = pathlib.Path(workdir)
+      pbin = root / "pbin"
+      pbin.mkdir()
+      for tool in ("wc", "tr", "head", "tail", "unzip"):
+        src = shutil.which(tool)
+        if src:
+          (pbin / tool).symlink_to(src)
+      bs_file = root / "dir\\sub.txt"
+      bs_file.write_text("ok\n")
+      unreadable = root / "locked.txt"
+      unreadable.write_text("secret\n")
+      unreadable.chmod(0)
+      try:
+        cmd = deliverable_gate.build_verify_command([str(bs_file), str(unreadable)])
+        res = subprocess.run(
+            ["/bin/sh", "-c", cmd],
+            env={"PATH": str(pbin), "HOME": workdir},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        parsed = json.loads(res.stdout)
+        entries = {e["path"]: e for e in parsed["checked"]}
+        self.assertTrue(entries[str(bs_file)]["ok"])
+        if os.geteuid() != 0:
+          self.assertFalse(entries[str(unreadable)]["ok"])
+      finally:
+        unreadable.chmod(0o600)
+
+
+  def test_noisy_stderr_before_json_in_snapshot_and_verify(self) -> None:
+    """FRNT-5: Leading stderr warnings before JSON output do not break snapshot or verify."""
+
+    class NoisySession:
+
+      def __init__(self) -> None:
+        self.cancelled = None
+
+      async def exec(self, command: str, timeout_sec: int = 30) -> dict:
+        if "mtime" in command or "_IGNORED" in command or "os.walk" in command:
+          return {
+              "ok": True,
+              "exit_code": 0,
+              "output": 'Warning: locale not set\n{"out.txt": [5, 100]}',
+          }
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "output": (
+                "Notice: archive comment\n"
+                '{"checked": [{"path": "out.txt", "size": 5, "checks":'
+                ' ["exists", "non_empty"], "ok": true, "error": null}]}'
+            ),
+        }
+
+    session = NoisySession()
+    snap = asyncio.run(deliverable_gate.snapshot_workdir(session, "/app"))
+    self.assertEqual(snap, {"out.txt": (5, 100)})
+    report = asyncio.run(
+        deliverable_gate.verify_deliverables(session, ["out.txt"])
+    )
+    self.assertEqual(report["passed"], 1)
+    self.assertEqual(report["failed"], 0)
 
 
 if __name__ == "__main__":

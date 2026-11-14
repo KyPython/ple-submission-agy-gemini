@@ -525,6 +525,33 @@ _PROVIDER_SECRET_RE = re.compile(
 )
 
 
+def parse_last_json_dict(output: str) -> dict[str, Any] | None:
+  """Parses a JSON object from mixed stderr/stdout container command output."""
+  text = (output or "").strip()
+  if not text:
+    return None
+  try:
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+      return parsed
+  except ValueError:
+    pass
+  for raw_line in reversed(text.splitlines()):
+    line = raw_line.strip()
+    if not line:
+      continue
+    start = line.find("{")
+    while start != -1:
+      try:
+        parsed = json.loads(line[start:])
+        if isinstance(parsed, dict):
+          return parsed
+      except ValueError:
+        pass
+      start = line.find("{", start + 1)
+  return None
+
+
 def redact_secrets(
     value: Any, *, extra_secrets: tuple[str, ...] | list[str] = ()
 ) -> str:
@@ -640,16 +667,15 @@ def mcp_allows(url: str, servers: list[dict[str, Any]]) -> bool:
       base_parts = urllib.parse.urlsplit(base)
     except ValueError:
       continue
-    if _origin_key(base_parts) != origin:
+    if _origin_key(base_parts) != origin or parts.port != base_parts.port:
       continue
     if url == base:
       return True
     if base_parts.query:
       continue
-    base_path = base_parts.path
-    if path == base_path and (not parts.query or url.endswith("?" + parts.query)):
+    if url.startswith(base + "?"):
       return True
-    if path.startswith(base_path.rstrip("/") + "/"):
+    if not parts.fragment and path.startswith(base_parts.path.rstrip("/") + "/"):
       return True
   return False
 
@@ -1203,16 +1229,17 @@ class Relay:
     return reply["status"], back, resp_body
 
 
-def _filter_tools_list_body(body: bytes, allowed_tools: set[str]) -> bytes:
-  """Filters JSON `tools/list` response payloads to `allowed_tools`."""
-  try:
-    text = body.decode("utf-8").strip()
-    if not text.startswith(("{", "[")):
-      return body
-    payload = json.loads(text)
-  except (UnicodeDecodeError, ValueError):
-    return body
-  items = payload if isinstance(payload, list) else [payload]
+def _split_sse_block(block: str) -> tuple[list[str], str]:
+  """Separates non-`data:` SSE lines from joined `data:` payload text."""
+  lines = block.splitlines()
+  other = [line for line in lines if not line.startswith("data:")]
+  data = "\n".join(line[5:].lstrip() for line in lines if line.startswith("data:"))
+  return other, data
+
+
+def _filter_rpc_tools(data: Any, allowed_tools: set[str]) -> bool:
+  """Mutates parsed JSON-RPC object(s) to keep only `allowed_tools`."""
+  items = data if isinstance(data, list) else [data]
   changed = False
   for item in items:
     if not isinstance(item, dict):
@@ -1225,7 +1252,47 @@ def _filter_tools_list_body(body: bytes, allowed_tools: set[str]) -> bytes:
           if isinstance(t, dict) and t.get("name") in allowed_tools
       ]
       changed = True
-  return json.dumps(payload).encode() if changed else body
+  return changed
+
+
+def _filter_tools_list_body(body: bytes, allowed_tools: set[str]) -> bytes:
+  """Filters JSON or SSE `tools/list` response payloads to `allowed_tools`."""
+  try:
+    text = body.decode("utf-8")
+  except UnicodeDecodeError:
+    return body
+  stripped = text.strip()
+  if stripped.startswith(("{", "[")):
+    try:
+      payload = json.loads(stripped)
+    except ValueError:
+      return body
+    return json.dumps(payload).encode() if _filter_rpc_tools(payload, allowed_tools) else body
+
+  blocks = re.split(r"(\r?\n\r?\n)", text)
+  changed = False
+  out_blocks: list[str] = []
+  for idx, chunk in enumerate(blocks):
+    if idx % 2 == 1:
+      out_blocks.append(chunk)
+      continue
+    other_lines, data_text = _split_sse_block(chunk)
+    if not data_text:
+      out_blocks.append(chunk)
+      continue
+    try:
+      payload = json.loads(data_text)
+    except ValueError:
+      out_blocks.append(chunk)
+      continue
+    if _filter_rpc_tools(payload, allowed_tools):
+      changed = True
+      other_lines.append("data: " + json.dumps(payload))
+      sep = "\r\n" if "\r\n" in chunk else "\n"
+      out_blocks.append(sep.join(other_lines))
+    else:
+      out_blocks.append(chunk)
+  return "".join(out_blocks).encode() if changed else body
 
 
 def mcp_target(server_url: str, tail: str, query: str) -> str:
@@ -1364,11 +1431,7 @@ class MCPClient:
       chunks = [text]
     else:
       chunks = [
-          "\n".join(
-              line[5:].lstrip()
-              for line in block.splitlines()
-              if line.startswith("data:")
-          )
+          _split_sse_block(block)[1]
           for block in re.split(r"\r?\n\r?\n", text)
       ]
     found = []

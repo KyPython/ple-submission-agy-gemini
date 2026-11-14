@@ -212,6 +212,35 @@ class PdfInspectionTests(unittest.TestCase):
       self.assertEqual(blocks[0]["type"], "text")
       self.assertIn("shell", blocks[0]["text"].lower())
 
+    # Stderr warnings before valid JSON must still render + clean up tmpdir
+    noisy_cmds: list[str] = []
+
+    def fake_noisy_relay(route: str, **fields):
+      if route == "read_file":
+        raw = b"%PDF-1.7\n%%EOF\n" if fields["path"] == "/app/noisy.pdf" else SAMPLE_PNG
+        return {"ok": True, "truncated": False, "size": len(raw), "content_b64": base64.b64encode(raw).decode()}
+      if route == "exec":
+        cmd = fields["command"]
+        noisy_cmds.append(cmd)
+        if "rm -rf" in cmd:
+          return {"ok": True, "exit_code": 0, "output": ""}
+        payload = {
+            "ok": True,
+            "tmpdir": "/tmp/pdfview-noisy",
+            "total_pages": 1,
+            "rendered_pages": [1],
+            "dpi": 150,
+            "renderer": "fitz",
+            "files": [{"page": 1, "path": "/tmp/pdfview-noisy/page_1.png", "mime": "image/png", "bytes": len(SAMPLE_PNG)}],
+        }
+        return {"ok": True, "exit_code": 0, "output": "MuPDF warning: minor xref issue\n" + json.dumps(payload)}
+      raise AssertionError(route)
+
+    with mock.patch.object(task_mcp, "relay", side_effect=fake_noisy_relay):
+      noisy_blocks = task_mcp.read_file("/app/noisy.pdf")
+    self.assertEqual(len([b for b in noisy_blocks if b["type"] == "image"]), 1)
+    self.assertTrue(any("rm -rf" in c and "/tmp/pdfview-noisy" in c for c in noisy_cmds))
+
   def test_raster_image_magic_and_text_cad_no_regression(self) -> None:
     """FRNT-4.5: PNG/WEBP magic images, oversize image rejection, and UTF-8 ASCII CAD text unchanged."""
     webp = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"\x00" * 16
@@ -262,6 +291,43 @@ class PdfInspectionTests(unittest.TestCase):
         self.assertIn(label, txt)
         self.assertIn(str(len(raw)), txt)
         self.assertIn("shell", txt.lower())
+
+  def test_pdf_failed_json_parse_still_cleans_up_tmpdir(self) -> None:
+    """FRNT-4.5: Cleanup removes /tmp/pdfview-* even when renderer crashes non-JSON."""
+    probe_cmd = task_mcp._build_header_probe_command("/tmp/a b.pdf")
+    self.assertIn("head -c 5", probe_cmd)
+    self.assertIn("read(16)", probe_cmd)
+
+    exec_cmds: list[str] = []
+
+    def fake_relay(route: str, **fields):
+      if route == "read_file":
+        return {
+            "ok": True,
+            "truncated": False,
+            "size": 16,
+            "content_b64": base64.b64encode(b"%PDF-1.4\n%%EOF\n").decode(),
+        }
+      if route == "exec":
+        cmd = fields["command"]
+        exec_cmds.append(cmd)
+        if cmd.startswith("rm -rf"):
+          return {"ok": True, "exit_code": 0, "output": ""}
+        return {
+            "ok": True,
+            "exit_code": 1,
+            "output": "fatal: crashed working in /tmp/pdfview-bad\nnot json",
+        }
+      raise AssertionError(route)
+
+    with mock.patch.object(task_mcp, "relay", side_effect=fake_relay):
+      blocks = task_mcp.read_file("/app/broken.pdf")
+
+    self.assertEqual(len(blocks), 1)
+    self.assertIn("corrupt_or_encrypted", blocks[0]["text"])
+    self.assertTrue(
+        any("rm -rf" in c and "/tmp/pdfview-bad" in c for c in exec_cmds)
+    )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ import re
 import shlex
 from typing import Any, Iterable
 
+import taskbridge
+
 MAX_REPAIR_ATTEMPTS = 2
 REPAIR_RESERVE_SEC = 120
 
@@ -246,11 +248,8 @@ async def snapshot_workdir(
     return {}
   if not res.get("ok") or res.get("exit_code") != 0:
     return {}
-  try:
-    raw = json.loads((res.get("output") or "").strip() or "{}")
-  except ValueError:
-    return {}
-  if not isinstance(raw, dict):
+  raw = taskbridge.parse_last_json_dict(res.get("output") or "")
+  if not raw:
     return {}
   out: dict[str, tuple[int, int]] = {}
   for path, meta in raw.items():
@@ -354,43 +353,65 @@ def discover_candidates(
   return ordered
 
 
+def _posix_verify_snippet(path: str) -> str:
+  """Builds a POSIX shell snippet validating a single candidate without python3."""
+  qp = shlex.quote(path)
+  jpath = shlex.quote(json.dumps(path))
+  ext = posixpath.splitext(path)[1].lower()
+  checks_list = ["exists", "non_empty"]
+  extra = ""
+  if ext == ".zip":
+    checks_list.append("zip")
+    extra = (
+        'if [ "$ok" = "true" ] && command -v unzip >/dev/null 2>&1; then '
+        'unzip -tqq "$p" >/dev/null 2>&1 || { err=\'"corrupt zip"\'; ok=false; }; '
+        "fi; "
+    )
+  elif ext == ".pdf":
+    checks_list.append("pdf")
+    extra = (
+        'if [ "$ok" = "true" ]; then '
+        'if [ "$(head -c 5 "$p" 2>/dev/null | LC_ALL=C tr -d \'\\000\')"'
+        " != '%PDF-' ]; then "
+        'err=\'"missing %PDF- header"\'; ok=false; '
+        'elif ! tail -c 1024 "$p" 2>/dev/null | LC_ALL=C tr -d \'\\000\''
+        " | LC_ALL=C grep -q -F '%%EOF'; then "
+        'err=\'"missing %%EOF marker in trailing 1024 bytes"\'; ok=false; '
+        "fi; fi; "
+    )
+  jchecks = shlex.quote(json.dumps(checks_list))
+  return (
+      f"p={qp}; "
+      'if [ ! -f "$p" ]; then '
+      'err=\'"file does not exist or is not a regular file"\'; sz=null; ok=false; '
+      'elif [ ! -r "$p" ]; then '
+      'err=\'"file is not readable"\'; sz=null; ok=false; '
+      "else "
+      'sz=$(wc -c < "$p" 2>/dev/null | tr -d \'[:space:]\'); '
+      'case "$sz" in '
+      '\'\'|*[!0-9]*) sz=null; err=\'"file is not readable"\'; ok=false;; '
+      '*) if [ "$sz" -le 0 ]; then err=\'"file is 0 bytes"\'; ok=false; '
+      'else err=null; ok=true; fi;; '
+      "esac; "
+      "fi; "
+      + extra
+      + 'item=$(printf \'{"path":%s,"size":%s,"checks":%s,"ok":%s,"error":%s}\' '
+      + f'{jpath} "$sz" {jchecks} "$ok" "$err"); '
+      + 'if [ -z "$items" ]; then items="$item"; else items="$items,$item"; fi;'
+  )
+
+
 def build_verify_command(candidates: list[str]) -> str:
   """Builds a `$0` in-container script checking existence and syntax for candidates."""
-  fallback = (
-      "python3_missing=1; "
-      "echo '{\"checked\": []}'"
-  )
   # POSIX fallback for containers lacking python3 (e.g. bare ubuntu:24.04)
-  sh_checks = []
-  for path in candidates:
-    qp = shlex.quote(path)
-    ext = posixpath.splitext(path)[1].lower()
-    sh_checks.append(
-        f"p={qp}; "
-        'if [ ! -f "$p" ]; then err="file does not exist or is not a regular file"; sz=null; ok=false; '
-        'else sz=$(wc -c < "$p" | tr -d " "); '
-        'if [ "$sz" -le 0 ] 2>/dev/null; then err="file is 0 bytes"; ok=false; '
-        'else err=null; ok=true; fi; fi; '
-        + (
-            'if [ "$ok" = "true" ] && command -v unzip >/dev/null 2>&1; then '
-            'unzip -tqq "$p" >/dev/null 2>&1 || { err="corrupt zip"; ok=false; }; fi; '
-            if ext == ".zip"
-            else ""
-        )
-    )
-  if sh_checks:
+  if candidates:
     fallback = (
         "items=''; "
-        + " ".join(
-            c
-            + 'ep=$(printf \'%s\' "$p" | sed \'s/"/\\\\"/g\'); '
-            + 'ee=$(if [ "$err" = "null" ]; then echo null; else echo "\\"$err\\""; fi); '
-            + 'item="{\\"path\\":\\"$ep\\",\\"size\\":$sz,\\"checks\\":[\\"exists\\",\\"non_empty\\"],\\"ok\\":$ok,\\"error\\":$ee}"; '
-            + 'if [ -z "$items" ]; then items="$item"; else items="$items,$item"; fi;'
-            for c in sh_checks
-        )
-        + ' echo "{\\"checked\\":[$items]}"'
+        + " ".join(_posix_verify_snippet(path) for path in candidates)
+        + ' printf \'{"checked":[%s]}\\n\' "$items"'
     )
+  else:
+    fallback = 'printf \'{"checked":[]}\\n\''
   return (
       "if command -v python3 >/dev/null 2>&1; then "
       f"python3 -c {shlex.quote(_CONTAINER_VERIFY_SCRIPT)} "
@@ -414,12 +435,9 @@ async def verify_deliverables(
   res = await session.exec(build_verify_command(candidates), timeout_sec=60)
   checked: list[dict[str, Any]] = []
   if res.get("ok") and res.get("exit_code") == 0:
-    try:
-      parsed = json.loads((res.get("output") or "").strip())
-      if isinstance(parsed, dict) and isinstance(parsed.get("checked"), list):
-        checked = parsed["checked"]
-    except ValueError:
-      checked = []
+    parsed = taskbridge.parse_last_json_dict(res.get("output") or "")
+    if parsed and isinstance(parsed.get("checked"), list):
+      checked = parsed["checked"]
   if not checked:
     detail = (res.get("error") or res.get("output") or f"exit_code={res.get('exit_code')}")[:200]
     checked = [{
