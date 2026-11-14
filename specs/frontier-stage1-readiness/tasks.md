@@ -11,8 +11,8 @@ Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 1: Stage 1 Licensing & Packaging Foundation
 
-- [ ] 5. Add the standard Apache License Version 2.0 `LICENSE` file at `/Users/ky/physical-engineering/agy-gemini/LICENSE` matching existing file headers (FRNT-6.1)
-- [ ] 6. Verify `submission.yaml` Stage 2 settings (`google-cloud/gemini-4-argon`, `install.sh`, `serve.py`, quoted `env`), LF line endings on `install.sh`, clean `requirements.txt` isolation via `uv`, zero secrets/LFS/excluded `artifacts*` dirs, and no runtime reads of `artifacts/` or `eval/` (FRNT-6.2, FRNT-6.3, FRNT-6.4, FRNT-6.5)
+- [x] 5. Add the standard Apache License Version 2.0 `LICENSE` file at `/Users/ky/physical-engineering/agy-gemini/LICENSE` matching existing file headers (FRNT-6.1) — *Done (`LICENSE` added, verified by `tests/test_stage1_packaging.py`)*
+- [x] 6. Verify `submission.yaml` Stage 2 settings (`google-cloud/gemini-4-argon`, `install.sh`, `serve.py`, quoted `env`), LF line endings on `install.sh`, clean `requirements.txt` isolation via `uv`, zero secrets/LFS/excluded `artifacts*` dirs, and no runtime reads of `artifacts/` or `eval/` (FRNT-6.2, FRNT-6.3, FRNT-6.4, FRNT-6.5) — *Done (verified by `tests/test_stage1_packaging.py` & `kit validate`)*
 
 ## Phase 2: Container-Scoped Permissions & MCP Boundary Containment
 
