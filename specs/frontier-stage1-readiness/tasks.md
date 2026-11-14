@@ -4,10 +4,10 @@ Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 0: Pre-Implementation Empirical Container & Baseline Checks ($0 Offline)
 
-- [ ] 1. Build the baseline bundle (`uv run python -m kit build .`) offline inside `ple-bench` to measure the current `/opt/harness` packed and unpacked size against `MAX_BUNDLE_BYTES` (`2 GiB`) (FRNT-6.3)
-- [ ] 2. Run `/opt/harness/bin/agy --help` and inspect `agy` 1.4.10 CLI/settings behavior inside the built `linux/amd64` serve container to determine exact non-interactive policy flags replacing `--dangerously-skip-permissions`, verify `"allowNonWorkspaceAccess": false` behavior with `$HOME/.gemini`, and confirm `tools: []` enforcement (FRNT-1.1, FRNT-1.2, FRNT-1.3)
-- [ ] 3. Test `agy` 1.4.10 `mcp_config.json` handling of `"eager": false` vs omitted `"tools"` / tool caps using a local dummy MCP server so prompt-token mitigation matches actual binary behavior (FRNT-3.3)
-- [ ] 4. Probe representative PLE task container images offline for installed PDF rasterizers (`pdftoppm`, `mutool`, `gs`, `fitz`, `pypdfium2`) to confirm runtime discovery order and fallback paths (FRNT-4.1, FRNT-4.4)
+- [x] 1. Build the baseline bundle (`uv run python -m kit build .`) offline inside `ple-bench` to measure the current `/opt/harness` packed and unpacked size against `MAX_BUNDLE_BYTES` (`2 GiB`) (FRNT-6.3) — *Done (`174.01 MiB` packed / `561.44 MiB` unpacked / `10,700` members)*
+- [x] 2. Run `/opt/harness/bin/agy --help` and inspect `agy` 1.4.10 CLI/settings behavior inside the built `linux/amd64` serve container to determine exact non-interactive policy flags replacing `--dangerously-skip-permissions`, verify `"allowNonWorkspaceAccess": false` behavior with `$HOME/.gemini`, and confirm `tools: []` enforcement (FRNT-1.1, FRNT-1.2, FRNT-1.3) — *Done (findings recorded in `design.md`)*
+- [x] 3. Test `agy` 1.4.10 `mcp_config.json` handling of `"eager": false` vs omitted `"tools"` / tool caps using a local dummy MCP server so prompt-token mitigation matches actual binary behavior (FRNT-3.3) — *Done (findings recorded in `design.md`)*
+- [x] 4. Probe representative PLE task container images offline for installed PDF rasterizers (`pdftoppm`, `mutool`, `gs`, `fitz`, `pypdfium2`) to confirm runtime discovery order and fallback paths (FRNT-4.1, FRNT-4.4) — *Done for cached base images (`plebench-serve:d61dfd66aaacd0a6`, `ubuntu:24.04`, `plebench-builder:5f1332de50594db5`/`debian:bookworm`, `python:3.12-slim`: all none); specialized Harbor/HF task containers not yet cached locally (`~/.cache/plebench/` has no task images) and remain to be checked when task images are pulled*
 
 ## Phase 1: Stage 1 Licensing & Packaging Foundation
 
