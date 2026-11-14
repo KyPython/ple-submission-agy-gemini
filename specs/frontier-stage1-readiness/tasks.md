@@ -29,12 +29,12 @@ Spec ID: FRNT · Status: approved by Ky on 2026-11-13
 
 ## Phase 4: Programmatic Deliverable Verification Gate
 
-- [ ] 14. Implement task-agnostic candidate deliverable discovery and deterministic `$0` format validators (existence, `size > 0`, `.zip` integrity, `.json`/`.csv`/`.xml`/`.svg`/`.py`/`.pdf` syntax checks) executed via `session.exec(...)` inside the task container (FRNT-5.1, FRNT-5.2)
-- [ ] 15. Integrate the post-run verification gate and bounded `--conversation` repair loop (`MAX_REPAIR_ATTEMPTS`, `STOP_BEFORE_SEC + REPAIR_RESERVE_SEC`, `session.cancelled` guard, structured `session.log` summary) into `serve.py` `solve()` before exit (FRNT-5.1, FRNT-5.3, FRNT-5.4)
+- [x] 14. Implement task-agnostic candidate deliverable discovery and deterministic `$0` format validators (existence, `size > 0`, `.zip` integrity, `.json`/`.csv`/`.xml`/`.svg`/`.py`/`.pdf` syntax checks) executed via `session.exec(...)` inside the task container (FRNT-5.1, FRNT-5.2) — *Done (`deliverable_gate.py`, `Relay.written_paths` in `taskbridge.py`)*
+- [x] 15. Integrate the post-run verification gate and bounded `--conversation` repair loop (`MAX_REPAIR_ATTEMPTS`, `STOP_BEFORE_SEC + REPAIR_RESERVE_SEC`, `session.cancelled` guard, structured `session.log` summary) into `serve.py` `solve()` before exit (FRNT-5.1, FRNT-5.3, FRNT-5.4) — *Done (`_run_agy_turn`, `_run_verification_and_repair` in `serve.py`)*
 
 ## Phase 5: Offline $0 Test Suite & Stage 1 Readiness Verification
 
 - [x] 16. Write and run offline `$0` boundary tests in `tests/test_permissions_boundary.py` covering positive authorized MCP flows and negative escape, invalid-arg, bad-URL, secret-redaction, policy-fail-closed, and MCP tool-scoping checks (FRNT-1.1, FRNT-1.2, FRNT-1.3, FRNT-1.4, FRNT-1.5, FRNT-2.1, FRNT-2.2, FRNT-2.3, FRNT-2.4, FRNT-2.5, FRNT-3.1, FRNT-3.2, FRNT-3.3, FRNT-3.4) — *Done (14/14 passing)*
 - [x] 17. Write and run offline `$0` PDF and drawing inspection tests in `tests/test_pdf_inspection.py` covering multi-page rendering, >10 MB PDFs, DPI downscaling, missing renderer/corrupt PDF fallbacks, `IMAGE_MAGIC` regressions, and binary CAD metadata summaries (FRNT-4.1, FRNT-4.2, FRNT-4.3, FRNT-4.4, FRNT-4.5, FRNT-4.6) — *Done (6/6 passing)*
-- [ ] 18. Write and run offline `$0` verification gate tests in `tests/test_deliverable_gate.py` covering candidate discovery, format checks, bounded `--conversation` repair trigger, exhaustion/low-budget exit, and cancellation safety (FRNT-5.1, FRNT-5.2, FRNT-5.3, FRNT-5.4)
+- [x] 18. Write and run offline `$0` verification gate tests in `tests/test_deliverable_gate.py` covering candidate discovery, format checks, bounded `--conversation` repair trigger, exhaustion/low-budget exit, and cancellation safety (FRNT-5.1, FRNT-5.2, FRNT-5.3, FRNT-5.4) — *Done (4/4 passing)*
 - [ ] 19. Write and run offline `$0` packaging tests in `tests/test_stage1_packaging.py` plus `uv run python -m kit validate .` and `scripts/check_submission.sh` with `scripts/mock_proxy.py` (no paid API calls) and verify final bundle size `< 2 GiB` (`<= 512 MiB` target) (FRNT-6.1, FRNT-6.2, FRNT-6.3, FRNT-6.4, FRNT-6.5)

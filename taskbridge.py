@@ -41,6 +41,7 @@ import itertools
 import json
 import math
 import os
+import posixpath
 import re
 import secrets
 import signal
@@ -805,6 +806,7 @@ class Relay:
     self.url = ""
     self._server = None
     self.allowed_mcp_tools: dict[str, set[str]] = {}
+    self.written_paths: list[str] = []
 
   def set_mcp_policy(self, server_name: str, allowed_tools: set[str]) -> None:
     """Restricts forwarded JSON-RPC `tools/call` tools for `server_name`."""
@@ -997,12 +999,17 @@ class Relay:
           raise TaskError(
               "write_file: content_b64 is not base64 text"
           ) from None
+        written_path = fields.get("path")
         result = {
             "ok": True,
             "size": await self.session.write_file(
-                fields.get("path"), data, bool(fields.get("append"))
+                written_path, data, bool(fields.get("append"))
             ),
         }
+        if isinstance(written_path, str):
+          norm_written = posixpath.normpath(written_path)
+          if norm_written not in self.written_paths:
+            self.written_paths.append(norm_written)
     except TaskError as exc:
       result = {
           "ok": False,

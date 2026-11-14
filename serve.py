@@ -42,6 +42,7 @@ import tempfile
 import time
 from typing import Any
 
+import deliverable_gate
 import taskbridge
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -645,11 +646,172 @@ async def configure(
   (home / "workspace").mkdir()
 
 
+async def _run_agy_turn(
+    session: taskbridge.Session,
+    relay: taskbridge.Relay,
+    home: pathlib.Path,
+    prompt: str,
+    *,
+    conversation: str | None,
+    run_index: int,
+    runs: list[dict[str, Any]],
+) -> tuple[taskbridge.Finished | None, dict[str, Any], Watch, str | None]:
+  """Runs one hardened `agy` turn, checks policy enforcement, and updates `runs`."""
+  stream, pidfile = home / f"stream{run_index}.jsonl", home / f"agy{run_index}.pid"
+  env = relay.env({
+      **os.environ,
+      "HOME": str(home),
+      "AGY_STREAM": str(stream),
+      "AGY_PID": str(pidfile),
+      "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
+  })
+  prompt_args, stdin = prompt_input(prompt)
+  cli_args = build_agy_argv(prompt_args, conversation=conversation)
+  settings_loaded = json.loads(
+      (home / ".gemini" / "antigravity-cli" / "settings.json").read_text()
+  )
+  agent_loaded = (
+      home / ".gemini" / "config" / "agents" / "task-agent.md"
+  ).read_text()
+  try:
+    validate_serve_policy(settings_loaded, agent_loaded, cli_args)
+  except RuntimeError as exc:
+    await session.log(json.dumps({"event": "policy_error", "error": str(exc)}))
+    raise
+  # the shell writes its pid and then becomes agy, so Watch can signal
+  # agy's process group
+  argv = [
+      "/bin/sh",
+      "-c",
+      'echo $$ > "$AGY_PID"; exec "$0" "$@" > "$AGY_STREAM"',
+      AGY,
+      *cli_args,
+  ]
+  watch = Watch(stream, pidfile)
+  watcher = asyncio.create_task(watch.run())
+  finished = None
+  try:
+    finished = await taskbridge.run_process(
+        argv,
+        session,
+        env=env,
+        cwd=str(home / "workspace"),
+        stdin=stdin,
+        stop_before_sec=STOP_BEFORE_SEC,
+        log_prefix="agy: ",
+    )
+  finally:
+    watcher.cancel()
+    runs.append(read_stream(stream))
+    session.final_message = final_message(runs) or session.final_message
+  if runs[-1]["local_tools"]:
+    msg = (
+        "policy error: unexpected serve-container local tool execution:"
+        f" {runs[-1]['local_tools']}"
+    )
+    await session.log(json.dumps({"event": "policy_error", "error": msg}))
+    raise RuntimeError(msg)
+  policy_text = "\n".join(
+      part
+      for part in (
+          finished.stderr if finished else "",
+          str(runs[-1].get("error") or ""),
+      )
+      if part
+  )
+  if finished and finished.code != 0 and _POLICY_ERROR_RE.search(policy_text):
+    msg = (
+        "policy error: agy rejected policy configuration"
+        f" ({policy_text[:200]})"
+    )
+    await session.log(json.dumps({"event": "policy_error", "error": msg}))
+    raise RuntimeError(msg)
+  return finished, runs[-1], watch, runs[-1]["conversation"] or conversation
+
+
+async def _run_verification_and_repair(
+    session: taskbridge.Session,
+    relay: taskbridge.Relay,
+    home: pathlib.Path,
+    before_files: dict[str, tuple[int, int]],
+    conversation: str | None,
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+  """Verifies deliverables via $0 checks and runs bounded `--conversation` repair."""
+  if session.cancelled.is_set():
+    report = {
+        "event": "deliverable_verification",
+        "checked": [],
+        "passed": 0,
+        "failed": 0,
+        "repair_triggered": False,
+        "skipped_reason": "cancelled",
+    }
+    await session.log(json.dumps(report))
+    return report
+
+  async def run_check() -> dict[str, Any]:
+    after_files = await deliverable_gate.snapshot_workdir(
+        session, session.workdir
+    )
+    candidates = deliverable_gate.discover_candidates(
+        workdir=session.workdir,
+        instruction=session.instruction,
+        final_message=session.final_message or "",
+        written_paths=getattr(relay, "written_paths", ()),
+        before=before_files,
+        after=after_files,
+    )
+    return await deliverable_gate.verify_deliverables(session, candidates)
+
+  report = await run_check()
+  repair_triggered = False
+  repair_attempts = 0
+  while (
+      report["failed"] > 0
+      and repair_attempts < deliverable_gate.MAX_REPAIR_ATTEMPTS
+      and conversation
+      and not session.cancelled.is_set()
+  ):
+    left = session.time_left()
+    if (
+        left is not None
+        and left <= STOP_BEFORE_SEC + deliverable_gate.REPAIR_RESERVE_SEC
+    ):
+      break
+    repair_triggered = True
+    repair_attempts += 1
+    await session.log(
+        f"deliverable gate failed ({report['failed']} item(s)); triggering"
+        f" bounded repair {repair_attempts}/"
+        f"{deliverable_gate.MAX_REPAIR_ATTEMPTS}"
+    )
+    repair_prompt = deliverable_gate.build_repair_prompt(report)
+    _, _, _, conversation = await _run_agy_turn(
+        session,
+        relay,
+        home,
+        repair_prompt,
+        conversation=conversation,
+        run_index=len(runs),
+        runs=runs,
+    )
+    if session.cancelled.is_set():
+      break
+    report = await run_check()
+
+  report["repair_triggered"] = repair_triggered
+  report["repair_attempts"] = repair_attempts
+  await session.log(json.dumps(report))
+  return report
+
+
 async def solve(session: taskbridge.Session) -> str:
   """Runs `agy` on the task and returns the final message.
 
   A run that stalled, lost its connection before answering, or was rate limited
-  is resumed in the same conversation (`resume_wait`).
+  is resumed in the same conversation (`resume_wait`), then validated by a
+  deterministic `$0` deliverable gate with bounded `--conversation` repair.
 
   Args:
     session: Active task session.
@@ -659,9 +821,10 @@ async def solve(session: taskbridge.Session) -> str:
 
   Raises:
     RuntimeError: If `agy` exits with an error before using any tools or
-      streaming any text.
+      streaming any text, or violates security policy checks.
   """
   runs: list[dict[str, Any]] = []
+  report: dict[str, Any] | None = None
   with tempfile.TemporaryDirectory(
       prefix="agy-",
       dir=os.environ.get("HOME") or "/tmp",
@@ -670,78 +833,21 @@ async def solve(session: taskbridge.Session) -> str:
     home = pathlib.Path(scratch)
     async with taskbridge.Relay(session) as relay:
       await configure(session, relay, home)
+      before_files = await deliverable_gate.snapshot_workdir(
+          session, session.workdir
+      )
       prompt, conversation = session.instruction, None
       for n in range(MAX_RUNS):
-        stream, pidfile = home / f"stream{n}.jsonl", home / f"agy{n}.pid"
-        env = relay.env({
-            **os.environ,
-            "HOME": str(home),
-            "AGY_STREAM": str(stream),
-            "AGY_PID": str(pidfile),
-            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
-        })
-        prompt_args, stdin = prompt_input(prompt)
-        cli_args = build_agy_argv(prompt_args, conversation=conversation)
-        settings_loaded = json.loads(
-            (home / ".gemini" / "antigravity-cli" / "settings.json").read_text()
+        _, last_run, watch, conversation = await _run_agy_turn(
+            session,
+            relay,
+            home,
+            prompt,
+            conversation=conversation,
+            run_index=n,
+            runs=runs,
         )
-        agent_loaded = (
-            home / ".gemini" / "config" / "agents" / "task-agent.md"
-        ).read_text()
-        try:
-          validate_serve_policy(settings_loaded, agent_loaded, cli_args)
-        except RuntimeError as exc:
-          await session.log(
-              json.dumps({"event": "policy_error", "error": str(exc)})
-          )
-          raise
-        # the shell writes its pid and then becomes agy, so Watch can signal
-        # agy's process group
-        argv = [
-            "/bin/sh",
-            "-c",
-            'echo $$ > "$AGY_PID"; exec "$0" "$@" > "$AGY_STREAM"',
-            AGY,
-            *cli_args,
-        ]
-        watch = Watch(stream, pidfile)
-        watcher = asyncio.create_task(watch.run())
-        finished = None
-        try:
-          finished = await taskbridge.run_process(
-              argv,
-              session,
-              env=env,
-              cwd=str(home / "workspace"),
-              stdin=stdin,
-              stop_before_sec=STOP_BEFORE_SEC,
-              log_prefix="agy: ",
-          )
-        finally:
-          watcher.cancel()
-          runs.append(read_stream(stream))
-          session.final_message = final_message(runs) or session.final_message
-        if runs[-1]["local_tools"]:
-          msg = (
-              "policy error: unexpected serve-container local tool execution:"
-              f" {runs[-1]['local_tools']}"
-          )
-          await session.log(json.dumps({"event": "policy_error", "error": msg}))
-          raise RuntimeError(msg)
-        policy_text = "\n".join(
-            part
-            for part in (
-                finished.stderr if finished else "",
-                str(runs[-1].get("error") or ""),
-            )
-            if part
-        )
-        if finished and finished.code != 0 and _POLICY_ERROR_RE.search(policy_text):
-          msg = f"policy error: agy rejected policy configuration ({policy_text[:200]})"
-          await session.log(json.dumps({"event": "policy_error", "error": msg}))
-          raise RuntimeError(msg)
-        conversation = runs[-1]["conversation"] or conversation
-        wait = resume_wait(runs[-1], watch.stalled, n)
+        wait = resume_wait(last_run, watch.stalled, n)
         left = session.time_left()
         # resume only with at least two minutes to work before run_process would
         # stop agy
@@ -755,11 +861,24 @@ async def solve(session: taskbridge.Session) -> str:
         why = (
             f"was silent for {STALL_SEC // 60} minutes"
             if watch.stalled
-            else f"ended on {str(runs[-1]['error'])[:200]!r}"
+            else f"ended on {str(last_run['error'])[:200]!r}"
         )
         await session.log(f"agy {why}; resuming its conversation in {wait} s")
         await asyncio.sleep(wait)
         prompt = RESUME
+
+      pre_tools = sum((run["tools"] for run in runs), collections.Counter())
+      fatal_empty = (
+          bool(runs)
+          and runs[-1]["status"] == "ERROR"
+          and not pre_tools
+          and not any(run["texts"] for run in runs)
+      )
+      if not fatal_empty:
+        report = await _run_verification_and_repair(
+            session, relay, home, before_files, conversation, runs
+        )
+
   usage = collections.Counter()
   for run in runs:
     usage.update({k: v for k, v in run["usage"].items() if isinstance(v, int)})
