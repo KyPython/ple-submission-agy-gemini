@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import fnmatch
 import json
 import os
 import pathlib
@@ -58,6 +59,20 @@ MAX_RUNS = 4
 BACKOFF_SEC = 60
 # bytes; Linux refuses one argument over 128 KiB (MAX_ARG_STRLEN)
 MAX_ARGV_PROMPT = 100_000
+MAX_EAGER_EXTERNAL_MCP_TOOLS = max(
+    0, int(os.environ.get("AGY_MAX_EAGER_MCP_TOOLS") or "8")
+)
+_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_POLICY_ERROR_RE = re.compile(
+    r"unknown flag|flag provided but not defined|invalid toolPermission|"
+    r"required approval that headless mode cannot prompt for|auto-denied|"
+    r"not available for this account",
+    re.IGNORECASE,
+)
+_ALLOWED_BUILTINS = frozenset(
+    {"call_mcp_tool", "list_resources", "read_resource", "manage_task"}
+)
 TASK_TOOLS = ("shell", "read_file", "write_file", "edit_file")
 # Models built into agy 1.4.10 for a Gemini API key (`agy models`); agy applies
 # its own compaction limit to each
@@ -95,12 +110,13 @@ RATE_LIMIT = re.compile(
     r"throttled|\b429\b)",
     re.IGNORECASE,
 )
-# agy's settings.json: the Gemini API route, no prompts, no telemetry
+# agy's settings.json: strict non-bypass policy, no prompts, no telemetry
 SETTINGS = {
     "modelProvider": "gemini",
-    "toolPermission": "always-proceed",
-    "artifactReviewPolicy": "always-proceed",
-    "allowNonWorkspaceAccess": True,
+    "toolPermission": "strict",
+    "artifactReviewPolicy": "request-review",
+    "allowNonWorkspaceAccess": False,
+    "enableTerminalSandbox": True,
     "enableTelemetry": False,
     "showFeedbackSurvey": False,
     "showTips": False,
@@ -228,6 +244,7 @@ def read_stream(path: pathlib.Path) -> dict[str, Any]:
       "error": None,
       "usage": {},
       "tools": collections.Counter(),
+      "local_tools": [],
       "texts": [],
       "answered": False,
       "ended_on_error": True,
@@ -261,7 +278,15 @@ def read_stream(path: pathlib.Path) -> dict[str, Any]:
       if kind in ("tool", "error_message"):
         out["ended_on_error"] = kind == "error_message"
       if kind == "tool" and state == "DONE":
-        out["tools"][str(step.get("tool_name") or "?")] += 1
+        tname = str(step.get("tool_name") or "?")
+        out["tools"][tname] += 1
+        if (
+            not tname.startswith("mcp_")
+            and tname not in _ALLOWED_BUILTINS
+            and not step.get("is_error")
+            and not step.get("error")
+        ):
+          out["local_tools"].append(tname)
       # any later step means the preceding text was not the final answer
       if kind != "error_message" and state in ("ACTIVE", "DONE"):
         out["answered"] = False
@@ -384,6 +409,99 @@ async def stop(pgid: int) -> None:
     os.killpg(pgid, signal.SIGKILL)
 
 
+def _parse_patterns(env_name: str) -> list[str]:
+  """Reads comma-separated glob patterns from an environment variable."""
+  raw = os.environ.get(env_name, "")
+  return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _matches_any(patterns: list[str], server: str, tool: str) -> bool:
+  """Returns True if `tool` or `server:tool` matches any glob pattern."""
+  qualified = f"{server}:{tool}"
+  return any(
+      fnmatch.fnmatchcase(tool, p) or fnmatch.fnmatchcase(qualified, p)
+      for p in patterns
+  )
+
+
+def filter_mcp_tools(
+    server_name: str,
+    raw_names: list[Any],
+    *,
+    allow_patterns: list[str],
+    deny_patterns: list[str],
+    eager_budget: int,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+  """Filters external MCP tool names and splits eager vs deferred budgets."""
+  registered: list[str] = []
+  filtered: list[str] = []
+  seen: set[str] = set()
+  for item in raw_names:
+    if not isinstance(item, str) or not _TOOL_NAME_RE.fullmatch(item) or item in seen:
+      filtered.append(str(item))
+      continue
+    seen.add(item)
+    if allow_patterns and not _matches_any(allow_patterns, server_name, item):
+      filtered.append(item)
+      continue
+    if deny_patterns and _matches_any(deny_patterns, server_name, item):
+      filtered.append(item)
+      continue
+    registered.append(item)
+  eager = registered[: max(0, eager_budget)]
+  deferred = registered[max(0, eager_budget) :]
+  return registered, eager, deferred, filtered
+
+
+def build_agy_argv(
+    prompt_args: list[str],
+    *,
+    model: str | None = None,
+    conversation: str | None = None,
+) -> list[str]:
+  """Builds bounded non-interactive `agy` CLI flags without bypass."""
+  return [
+      *prompt_args,
+      "--agent",
+      "task-agent",
+      "--model",
+      model or model_slug(),
+      "--output-format",
+      "stream-json",
+      "--sandbox",
+      *(["--conversation", conversation] if conversation else []),
+  ]
+
+
+def validate_serve_policy(
+    settings: dict[str, Any], agent_md: str, argv: list[str]
+) -> None:
+  """Verifies serve-container containment policy and fails closed if weakened."""
+  fm_match = re.match(r"^---\n(.*?)\n---", agent_md, re.DOTALL)
+  if not fm_match or not re.search(
+      r"(?m)^tools:\s*\[\s*\]\s*$", fm_match.group(1)
+  ):
+    raise RuntimeError("policy error: task-agent.md must enforce tools: []")
+  if settings.get("allowNonWorkspaceAccess") is not False:
+    raise RuntimeError(
+        "policy error: allowNonWorkspaceAccess must be False"
+    )
+  if settings.get("toolPermission") != "strict":
+    raise RuntimeError(
+        "policy error: toolPermission must be 'strict' (non-bypass)"
+    )
+  if settings.get("artifactReviewPolicy") == "always-proceed":
+    raise RuntimeError(
+        "policy error: artifactReviewPolicy must not be 'always-proceed'"
+    )
+  if "--dangerously-skip-permissions" in argv:
+    raise RuntimeError(
+        "policy error: --dangerously-skip-permissions is forbidden"
+    )
+  if "--sandbox" not in argv:
+    raise RuntimeError("policy error: --sandbox CLI flag is required")
+
+
 async def configure(
     session: taskbridge.Session, relay: taskbridge.Relay, home: pathlib.Path
 ) -> None:
@@ -396,10 +514,13 @@ async def configure(
   """
   # task_mcp.py's server, under a name none of the task's servers has
   bridge, n = "task", 1
-  while bridge in {server["name"] for server in session.mcp_servers}:
+  valid_names = {
+      s.get("name") for s in session.mcp_servers if isinstance(s.get("name"), str)
+  }
+  while bridge in valid_names:
     n += 1
     bridge = f"task{n}"
-  servers = {
+  servers: dict[str, Any] = {
       bridge: {
           "command": sys.executable,
           "args": [str(HERE / "task_mcp.py")],
@@ -407,35 +528,98 @@ async def configure(
           "tools": {name: {"eager": True} for name in TASK_TOOLS},
       }
   }
+  allow_patterns = _parse_patterns("AGY_MCP_TOOL_ALLOWLIST")
+  deny_patterns = _parse_patterns("AGY_MCP_TOOL_DENYLIST")
+  max_eager_raw = os.environ.get("AGY_MAX_EAGER_MCP_TOOLS")
+  max_eager = (
+      max(0, int(max_eager_raw))
+      if max_eager_raw is not None and max_eager_raw.strip()
+      else MAX_EAGER_EXTERNAL_MCP_TOOLS
+  )
+  eager_remaining = max_eager
+  seen_servers: set[str] = {bridge}
   apps = []
   for server in session.mcp_servers:
-    try:
-      names = await mcp_tools(session, server["url"])
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    raw_name = server.get("name")
+    url = server.get("url")
+    if (
+        not isinstance(raw_name, str)
+        or not _SERVER_NAME_RE.fullmatch(raw_name)
+        or raw_name in seen_servers
+    ):
       await session.log(
-          f"MCP server {server['name']}: could not list its tools ({exc})"
+          json.dumps({
+              "event": "mcp_server_skipped",
+              "server": str(raw_name)[:64],
+              "reason": "invalid_or_duplicate_name",
+          })
       )
       continue
-    await session.log(f"MCP server {server['name']}: {len(names)} tools")
-    servers[server["name"]] = {
-        "serverUrl": relay.mcp_url(server["name"]),
-        "tools": {name: {"eager": True} for name in names},
-    }
-    apps.append(
-        f"`{server['name']}` ({len(names)} tools, named"
-        f" mcp_{server['name']}_<tool>)"
+    if not isinstance(url, str) or not taskbridge.mcp_allows(url, [server]):
+      await session.log(
+          json.dumps({
+              "event": "mcp_server_skipped",
+              "server": raw_name,
+              "reason": "disallowed_url",
+          })
+      )
+      continue
+    seen_servers.add(raw_name)
+    try:
+      names = await mcp_tools(session, url)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      await session.log(
+          f"MCP server {raw_name}: could not list its tools ({exc})"
+      )
+      continue
+    registered, eager, deferred, filtered = filter_mcp_tools(
+        raw_name,
+        names,
+        allow_patterns=allow_patterns,
+        deny_patterns=deny_patterns,
+        eager_budget=eager_remaining,
     )
+    eager_remaining = max(0, eager_remaining - len(eager))
+    eager_set = set(eager)
+    relay.set_mcp_policy(raw_name, set(registered))
+    await session.log(
+        json.dumps({
+            "event": "mcp_server_configured",
+            "server": raw_name,
+            "registered": len(registered),
+            "eager": len(eager),
+            "deferred": len(deferred),
+            "filtered": len(filtered),
+        })
+    )
+    servers[raw_name] = {
+        "serverUrl": relay.mcp_url(raw_name),
+        "tools": {t: {"eager": t in eager_set} for t in registered},
+    }
+    if deferred:
+      preview = ", ".join(deferred[:25])
+      more = f", ... (+{len(deferred) - 25} more)" if len(deferred) > 25 else ""
+      apps.append(
+          f"`{raw_name}` ({len(registered)} tools: {len(eager)} eager,"
+          f" {len(deferred)} deferred [{preview}{more}] via `call_mcp_tool`"
+          f" with ServerName=`{raw_name}`, ToolName, Arguments)"
+      )
+    else:
+      apps.append(
+          f"`{raw_name}` ({len(registered)} tools, named"
+          f" mcp_{raw_name}_<tool>)"
+      )
   config = home / ".gemini" / "config"
   (config / "agents").mkdir(parents=True)
   (config / "mcp_config.json").write_text(
       json.dumps({"mcpServers": servers}, indent=2)
   )
-  settings = SETTINGS
+  settings = dict(SETTINGS)
   custom = custom_model()
   if custom:
     name, entry = custom
     settings = {
-        **SETTINGS,
+        **settings,
         "customModelsConfig": {"customModels": {name: entry}},
     }
   (home / ".gemini" / "antigravity-cli").mkdir(parents=True)
@@ -449,11 +633,15 @@ async def configure(
   )
   left = session.time_left()
   minutes = "unlimited" if left is None else int(left // 60)
-  (config / "agents" / "task-agent.md").write_text(
-      AGENT.format(
-          workdir=session.workdir, minutes=minutes, apps=note, bridge=bridge
-      )
+  agent_md = AGENT.format(
+      workdir=session.workdir, minutes=minutes, apps=note, bridge=bridge
   )
+  validate_serve_policy(
+      settings,
+      agent_md,
+      build_agy_argv(["-p", "check"], model="validate"),
+  )
+  (config / "agents" / "task-agent.md").write_text(agent_md)
   (home / "workspace").mkdir()
 
 
@@ -493,6 +681,20 @@ async def solve(session: taskbridge.Session) -> str:
             "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
         })
         prompt_args, stdin = prompt_input(prompt)
+        cli_args = build_agy_argv(prompt_args, conversation=conversation)
+        settings_loaded = json.loads(
+            (home / ".gemini" / "antigravity-cli" / "settings.json").read_text()
+        )
+        agent_loaded = (
+            home / ".gemini" / "config" / "agents" / "task-agent.md"
+        ).read_text()
+        try:
+          validate_serve_policy(settings_loaded, agent_loaded, cli_args)
+        except RuntimeError as exc:
+          await session.log(
+              json.dumps({"event": "policy_error", "error": str(exc)})
+          )
+          raise
         # the shell writes its pid and then becomes agy, so Watch can signal
         # agy's process group
         argv = [
@@ -500,20 +702,13 @@ async def solve(session: taskbridge.Session) -> str:
             "-c",
             'echo $$ > "$AGY_PID"; exec "$0" "$@" > "$AGY_STREAM"',
             AGY,
-            *prompt_args,
-            "--agent",
-            "task-agent",
-            "--model",
-            model_slug(),
-            "--output-format",
-            "stream-json",
-            "--dangerously-skip-permissions",
-            *(["--conversation", conversation] if conversation else []),
+            *cli_args,
         ]
         watch = Watch(stream, pidfile)
         watcher = asyncio.create_task(watch.run())
+        finished = None
         try:
-          await taskbridge.run_process(
+          finished = await taskbridge.run_process(
               argv,
               session,
               env=env,
@@ -526,6 +721,25 @@ async def solve(session: taskbridge.Session) -> str:
           watcher.cancel()
           runs.append(read_stream(stream))
           session.final_message = final_message(runs) or session.final_message
+        if runs[-1]["local_tools"]:
+          msg = (
+              "policy error: unexpected serve-container local tool execution:"
+              f" {runs[-1]['local_tools']}"
+          )
+          await session.log(json.dumps({"event": "policy_error", "error": msg}))
+          raise RuntimeError(msg)
+        policy_text = "\n".join(
+            part
+            for part in (
+                finished.stderr if finished else "",
+                str(runs[-1].get("error") or ""),
+            )
+            if part
+        )
+        if finished and finished.code != 0 and _POLICY_ERROR_RE.search(policy_text):
+          msg = f"policy error: agy rejected policy configuration ({policy_text[:200]})"
+          await session.log(json.dumps({"event": "policy_error", "error": msg}))
+          raise RuntimeError(msg)
         conversation = runs[-1]["conversation"] or conversation
         wait = resume_wait(runs[-1], watch.stalled, n)
         left = session.time_left()

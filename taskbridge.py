@@ -509,12 +509,101 @@ def _seconds(value: Any) -> int:
   return min(max(1, int(value)), MAX_TIMEOUT_SEC)
 
 
+SENSITIVE_ENV_VARS = (
+    "GEMINI_API_KEY",
+    "MODEL_API_KEY",
+    "MODEL_PROXY_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
+    "MODEL_BASE_URL",
+    "MODEL_PROXY_URL",
+    "TASK_RELAY_URL",
+)
+_RELAY_URL_TOKEN_RE = re.compile(r"(https?://127\.0\.0\.1:\d+/)([0-9a-f]{16,64})")
+_PROVIDER_SECRET_RE = re.compile(
+    r"\b(?:AIza|sk-(?:ant-|proj-)?|gh[pousr]_|hf_|xox[baprs]-)[A-Za-z0-9_-]{8,}\b"
+)
+
+
+def redact_secrets(
+    value: Any, *, extra_secrets: tuple[str, ...] | list[str] = ()
+) -> str:
+  """Scrubs known API keys, relay tokens, and sensitive URLs from `value`.
+
+  Args:
+    value: Text or object to convert and sanitize.
+    extra_secrets: Additional secret substrings to redact.
+
+  Returns:
+    Sanitized string with matching secrets replaced by `[REDACTED]`.
+  """
+  text = value if isinstance(value, str) else str(value)
+  candidates: list[str] = []
+  for var in SENSITIVE_ENV_VARS:
+    val = os.environ.get(var, "")
+    if val:
+      candidates.append(val)
+  for item in extra_secrets:
+    if item:
+      candidates.append(item)
+  for secret in sorted(set(candidates), key=len, reverse=True):
+    if len(secret) >= 4:
+      text = text.replace(secret, "[REDACTED]")
+  text = _RELAY_URL_TOKEN_RE.sub(r"\1[REDACTED]", text)
+  text = _PROVIDER_SECRET_RE.sub("[REDACTED]", text)
+  return text
+
+
+def format_audit_record(
+    component: str,
+    tool: str,
+    target: str,
+    status: str,
+    duration_ms: int,
+    detail: str = "",
+    *,
+    bytes_count: int | None = None,
+    extra_secrets: tuple[str, ...] | list[str] = (),
+) -> str:
+  """Formats a structured single-line JSON audit log entry without secrets."""
+  record: dict[str, Any] = {
+      "audit": "mcp_dispatch",
+      "component": component,
+      "tool": tool,
+      "target": redact_secrets(target, extra_secrets=extra_secrets)[:200],
+      "status": status,
+      "duration_ms": max(0, int(duration_ms)),
+  }
+  if bytes_count is not None:
+    record["bytes"] = int(bytes_count)
+  if detail:
+    record["detail"] = redact_secrets(detail, extra_secrets=extra_secrets)[:200]
+  return json.dumps(record, separators=(",", ":"))
+
+
+def _origin_key(parts: urllib.parse.SplitResult) -> tuple[str, str, int] | None:
+  """Returns normalized `(scheme, hostname, port)` for an http/https URL."""
+  scheme = (parts.scheme or "").lower()
+  if scheme not in ("http", "https"):
+    return None
+  if parts.username is not None or parts.password is not None:
+    return None
+  host = (parts.hostname or "").lower()
+  if not host:
+    return None
+  try:
+    port = parts.port
+  except ValueError:
+    return None
+  return scheme, host, port if port is not None else (443 if scheme == "https" else 80)
+
+
 def mcp_allows(url: str, servers: list[dict[str, Any]]) -> bool:
   """Checks whether `url` is permitted by the evaluator's MCP server rules.
 
-  Allows exact MCP server URLs (optionally followed by a query string) or
-  subpaths beneath them. Rejects `.` or `..` segments, encoded slashes or
-  backslashes, literal backslashes, and `;` path parameters.
+  Requires an `http` or `https` scheme with a non-empty host matching a
+  configured MCP server origin, and permits only exact base URLs or safe
+  subpaths/queries beneath them. Rejects `.` or `..` segments, encoded slashes
+  or backslashes, literal backslashes, and `;` path parameters.
 
   Args:
     url: Candidate HTTP target URL.
@@ -523,10 +612,16 @@ def mcp_allows(url: str, servers: list[dict[str, Any]]) -> bool:
   Returns:
     `True` if the evaluator permits an `http` request to `url`, else `False`.
   """
+  if not isinstance(url, str) or not url:
+    return False
   try:
-    path = urllib.parse.urlsplit(url).path
+    parts = urllib.parse.urlsplit(url)
   except ValueError:
     return False
+  origin = _origin_key(parts)
+  if origin is None:
+    return False
+  path = parts.path
   decoded = urllib.parse.unquote(path)
   if (
       "%2f" in path.lower()
@@ -538,11 +633,22 @@ def mcp_allows(url: str, servers: list[dict[str, Any]]) -> bool:
     return False
   for server in servers:
     base = str(server.get("url") or "")
-    if base and (
-        url == base
-        or ("?" not in base and url.startswith(base + "?"))
-        or url.startswith(base.rstrip("/") + "/")
-    ):
+    if not base:
+      continue
+    try:
+      base_parts = urllib.parse.urlsplit(base)
+    except ValueError:
+      continue
+    if _origin_key(base_parts) != origin:
+      continue
+    if url == base:
+      return True
+    if base_parts.query:
+      continue
+    base_path = base_parts.path
+    if path == base_path and (not parts.query or url.endswith("?" + parts.query)):
+      return True
+    if path.startswith(base_path.rstrip("/") + "/"):
       return True
   return False
 
@@ -698,6 +804,39 @@ class Relay:
     self.token = secrets.token_hex(16)
     self.url = ""
     self._server = None
+    self.allowed_mcp_tools: dict[str, set[str]] = {}
+
+  def set_mcp_policy(self, server_name: str, allowed_tools: set[str]) -> None:
+    """Restricts forwarded JSON-RPC `tools/call` tools for `server_name`."""
+    self.allowed_mcp_tools[server_name] = set(allowed_tools)
+
+  def _secrets(self) -> tuple[str, ...]:
+    """Returns active session relay secrets for error/log redaction."""
+    return tuple(s for s in (self.url, self.token) if s)
+
+  async def _audit(
+      self,
+      tool: str,
+      target: str,
+      status: str,
+      started: float,
+      detail: str = "",
+      *,
+      bytes_count: int | None = None,
+  ) -> None:
+    """Writes a redacted structured audit log line via `session.log`."""
+    line = format_audit_record(
+        "relay_mcp",
+        tool,
+        target,
+        status,
+        round((time.monotonic() - started) * 1000),
+        detail,
+        bytes_count=bytes_count,
+        extra_secrets=self._secrets(),
+    )
+    with contextlib.suppress(Exception):
+      await self.session.log(line)
 
   async def __aenter__(self) -> Relay:
     self._server = await asyncio.start_server(
@@ -756,7 +895,9 @@ class Relay:
       )
     except BadRequest as exc:
       status, out_headers = exc.status, {"Content-Type": "application/json"}
-      payload = json.dumps({"error": str(exc)}).encode()
+      payload = json.dumps({
+          "error": redact_secrets(str(exc), extra_secrets=self._secrets())
+      }).encode()
     except asyncio.IncompleteReadError:
       status, out_headers = 400, {"Content-Type": "application/json"}
       payload = b'{"error": "the request ended before its body did"}'
@@ -769,7 +910,11 @@ class Relay:
     # One bad request never stops the relay.
     except Exception as exc:  # pylint: disable=broad-exception-caught
       status, out_headers = 500, {"Content-Type": "application/json"}
-      payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode()
+      payload = json.dumps({
+          "error": redact_secrets(
+              f"{type(exc).__name__}: {exc}", extra_secrets=self._secrets()
+          )
+      }).encode()
     head = f"HTTP/1.1 {status} {_REASONS.get(status, 'OK')}\r\n"
     out_headers = {
         **out_headers,
@@ -808,6 +953,14 @@ class Relay:
     route = path[len(prefix) :]
     if route.startswith("mcp/"):
       return await self._mcp(method, route[4:], query, headers, body)
+    if len(body) > MAX_BODY:
+      return (
+          413,
+          {"Content-Type": "application/json"},
+          json.dumps(
+              {"error": f"the body is larger than {MAX_BODY >> 20} MiB"}
+          ).encode(),
+      )
     if method != "POST" or route not in ("exec", "read_file", "write_file"):
       return 404, {}, b""
     try:
@@ -851,7 +1004,10 @@ class Relay:
             ),
         }
     except TaskError as exc:
-      result = {"ok": False, "error": str(exc)}
+      result = {
+          "ok": False,
+          "error": redact_secrets(str(exc), extra_secrets=self._secrets()),
+      }
     result = {k: v for k, v in result.items() if k not in ("type", "id")}
     return (
         200,
@@ -879,26 +1035,52 @@ class Relay:
     Returns:
       A tuple of `(status_code, response_headers, response_body_bytes)`.
     """
+    started = time.monotonic()
     name, _, tail = rest.partition("/")
+    server_name = urllib.parse.unquote(name)
     server = next(
         (
             s
             for s in self.session.mcp_servers
-            if s.get("name") == urllib.parse.unquote(name)
+            if s.get("name") == server_name
         ),
         None,
     )
     if server is None:
+      await self._audit(
+          f"{server_name}:{method}",
+          server_name,
+          "rejected",
+          started,
+          "unknown_server",
+          bytes_count=len(body),
+      )
       return 404, {}, b"no such MCP server"
     if method == "GET" or method not in HTTP_METHODS:
       # a GET opens a stream of server-sent events, which one http request and
       # its single response cannot carry
+      await self._audit(
+          f"{server_name}:{method}",
+          server_name,
+          "rejected",
+          started,
+          "method_not_allowed",
+          bytes_count=len(body),
+      )
       return (
           405,
           {"Allow": ", ".join(m for m in HTTP_METHODS if m != "GET")},
           b"",
       )
     if len(body) > MAX_HTTP_BYTES:
+      await self._audit(
+          f"{server_name}:{method}",
+          server_name,
+          "rejected",
+          started,
+          "body_too_large",
+          bytes_count=len(body),
+      )
       return (
           413,
           {"Content-Type": "application/json"},
@@ -909,6 +1091,41 @@ class Relay:
               )
           }).encode(),
       )
+    rpc_items: list[dict[str, Any]] = []
+    if method == "POST" and body:
+      try:
+        parsed = json.loads(body.decode("utf-8"))
+        raw_items = parsed if isinstance(parsed, list) else [parsed]
+        rpc_items = [item for item in raw_items if isinstance(item, dict)]
+      except (UnicodeDecodeError, ValueError):
+        rpc_items = []
+    rpc_label = ",".join(
+        str(item.get("method") or "?") for item in rpc_items[:4]
+    ) or method
+    allowed_tools = self.allowed_mcp_tools.get(server_name)
+    if allowed_tools is not None:
+      for item in rpc_items:
+        if item.get("method") == "tools/call":
+          params = item.get("params")
+          tool_name = params.get("name") if isinstance(params, dict) else None
+          if not isinstance(tool_name, str) or tool_name not in allowed_tools:
+            await self._audit(
+                f"{server_name}:tools/call",
+                str(tool_name or "?"),
+                "rejected",
+                started,
+                "tool_denied_by_policy",
+                bytes_count=len(body),
+            )
+            err_body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": item.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": f"tool {tool_name!r} denied by harness policy",
+                },
+            }).encode()
+            return 403, {"Content-Type": "application/json"}, err_body
     keep = (
         "content-type",
         "accept",
@@ -929,12 +1146,29 @@ class Relay:
     # refused here (a path outside the server, a bad header) or by the
     # evaluator
     except TaskError as exc:
+      redacted = redact_secrets(str(exc), extra_secrets=self._secrets())
+      await self._audit(
+          f"{server_name}:{rpc_label}",
+          server_name,
+          "error",
+          started,
+          redacted,
+          bytes_count=len(body),
+      )
       return (
           400,
           {"Content-Type": "application/json"},
-          json.dumps({"error": str(exc)}).encode(),
+          json.dumps({"error": redacted}).encode(),
       )
     if reply["truncated"]:
+      await self._audit(
+          f"{server_name}:{rpc_label}",
+          server_name,
+          "error",
+          started,
+          "truncated",
+          bytes_count=len(body),
+      )
       return (
           502,
           {},
@@ -946,7 +1180,45 @@ class Relay:
         if k.lower()
         in ("content-type", "mcp-session-id", "mcp-protocol-version")
     }
-    return reply["status"], back, reply["body"]
+    resp_body = reply["body"]
+    if allowed_tools is not None and any(
+        item.get("method") == "tools/list" for item in rpc_items
+    ):
+      resp_body = _filter_tools_list_body(resp_body, allowed_tools)
+    await self._audit(
+        f"{server_name}:{rpc_label}",
+        server_name,
+        "ok" if reply["status"] < 400 else "error",
+        started,
+        f"http_{reply['status']}",
+        bytes_count=len(body),
+    )
+    return reply["status"], back, resp_body
+
+
+def _filter_tools_list_body(body: bytes, allowed_tools: set[str]) -> bytes:
+  """Filters JSON `tools/list` response payloads to `allowed_tools`."""
+  try:
+    text = body.decode("utf-8").strip()
+    if not text.startswith(("{", "[")):
+      return body
+    payload = json.loads(text)
+  except (UnicodeDecodeError, ValueError):
+    return body
+  items = payload if isinstance(payload, list) else [payload]
+  changed = False
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    result = item.get("result")
+    if isinstance(result, dict) and isinstance(result.get("tools"), list):
+      result["tools"] = [
+          t
+          for t in result["tools"]
+          if isinstance(t, dict) and t.get("name") in allowed_tools
+      ]
+      changed = True
+  return json.dumps(payload).encode() if changed else body
 
 
 def mcp_target(server_url: str, tail: str, query: str) -> str:

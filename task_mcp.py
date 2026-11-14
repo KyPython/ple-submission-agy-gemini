@@ -28,6 +28,7 @@ import os
 import posixpath
 import sys
 import threading
+import time
 from typing import Any
 import urllib.request
 
@@ -35,7 +36,7 @@ import urllib.request
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import taskbridge  # pylint: disable=g-import-not-at-top,g-bad-import-order
 
-RELAY = os.environ["TASK_RELAY_URL"]
+RELAY = os.environ.get("TASK_RELAY_URL", "")
 WORKDIR = os.environ.get("TASK_WORKDIR", "/")
 MAX_TEXT = 40_000
 MAX_IMAGE = 5 << 20
@@ -50,6 +51,24 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # write_file and edit_file take turns, so concurrent edits cannot undo each
 # other
 _files = threading.Lock()
+_err_lock = threading.Lock()
+_CAPTURED_SECRETS: list[str] = []
+
+
+def _extra_secrets() -> tuple[str, ...]:
+  """Returns relay and scrubbed process secret values for redaction."""
+  vals = [RELAY, os.environ.get("TASK_RELAY_URL", ""), *_CAPTURED_SECRETS]
+  return tuple(v for v in vals if v)
+
+
+def _scrub_process_env() -> None:
+  """Captures sensitive env values for redaction, then drops keys from os.environ."""
+  for var in taskbridge.SENSITIVE_ENV_VARS:
+    if var == "TASK_RELAY_URL":
+      continue
+    val = os.environ.pop(var, "")
+    if val:
+      _CAPTURED_SECRETS.append(val)
 
 
 def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -148,9 +167,23 @@ def relay(route: str, **fields: Any) -> dict[str, Any]:
   Returns:
     The parsed JSON response dictionary from the relay.
   """
+  relay_url = RELAY or os.environ.get("TASK_RELAY_URL", "")
+  if not relay_url:
+    raise ValueError("TASK_RELAY_URL is not configured")
+  body = json.dumps(fields).encode("utf-8")
+  if len(body) > taskbridge.MAX_BODY:
+    raise ValueError(
+        f"{route}: request body is {len(body)} bytes, over MAX_BODY"
+        f" ({taskbridge.MAX_BODY})"
+    )
+  if route == "exec" and len(body) > taskbridge.MAX_FRAME - 1024:
+    raise ValueError(
+        f"exec: payload {len(body)} bytes approaches MAX_FRAME"
+        f" ({taskbridge.MAX_FRAME}); write a script with write_file instead"
+    )
   req = urllib.request.Request(
-      f"{RELAY}/{route}",
-      data=json.dumps(fields).encode(),
+      f"{relay_url}/{route}",
+      data=body,
       method="POST",
       headers={"Content-Type": "application/json"},
   )
@@ -224,8 +257,13 @@ def write_bytes(path: str, data: bytes) -> int:
     The number of bytes written.
 
   Raises:
-    ValueError: If the relay reports a write failure.
+    ValueError: If `data` exceeds `MAX_WRITE_BYTES` or the relay reports failure.
   """
+  if len(data) > taskbridge.MAX_WRITE_BYTES:
+    raise ValueError(
+        f"{path}: {len(data)} bytes exceeds MAX_WRITE_BYTES"
+        f" ({taskbridge.MAX_WRITE_BYTES})"
+    )
   r = relay(
       "write_file",
       path=path,
@@ -260,14 +298,20 @@ def shell(command: str, timeout_sec: int = 600) -> list[dict[str, Any]]:
     An MCP content list with the command's exit code and clipped output.
 
   Raises:
-    ValueError: If the relay rejects the `exec` request.
+    ValueError: If the command exceeds protocol frame limits or relay rejects.
   """
+  bounded_timeout = min(max(1, timeout_sec), taskbridge.MAX_TIMEOUT_SEC)
+  probe = json.dumps(
+      {"command": command, "timeout_sec": bounded_timeout}
+  ).encode("utf-8")
+  if len(probe) > taskbridge.MAX_FRAME - 1024:
+    raise ValueError(
+        f"shell command payload ({len(probe)} bytes) exceeds MAX_FRAME limit"
+    )
   r = relay(
       "exec",
       command=command,
-      timeout_sec=taskbridge.positive_int(
-          timeout_sec, taskbridge.MAX_TIMEOUT_SEC, taskbridge.MAX_TIMEOUT_SEC
-      ),
+      timeout_sec=bounded_timeout,
   )
   if not r.get("ok", True):
     raise ValueError(r.get("error"))
@@ -391,7 +435,115 @@ HANDLERS = {
     "write_file": write_file,
     "edit_file": edit_file,
 }
+_TOOL_SCHEMAS = {t["name"]: t["inputSchema"] for t in TOOLS}
 _out = threading.Lock()
+
+
+def _validate_str(key: str, val: Any, *, allow_empty: bool = False) -> str:
+  """Validates string fields for UTF-8 safety, optional non-emptiness, and NUL."""
+  if not isinstance(val, str):
+    raise ValueError(f"{key} must be a string")
+  if "\x00" in val and not allow_empty:
+    raise ValueError(f"{key} holds a NUL byte")
+  try:
+    val.encode("utf-8")
+  except UnicodeEncodeError:
+    raise ValueError(f"{key} contains unpaired UTF-16 surrogates") from None
+  if not allow_empty and not val.strip():
+    raise ValueError(f"{key} must be a non-empty string")
+  return val
+
+
+def _validate_pos_int(key: str, val: Any) -> int:
+  """Validates positive integers while rejecting booleans and floats."""
+  if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+    raise ValueError(f"{key} must be a positive integer")
+  return val
+
+
+def _validate_bool(key: str, val: Any) -> bool:
+  """Validates boolean parameters strictly."""
+  if not isinstance(val, bool):
+    raise ValueError(f"{key} must be a boolean")
+  return val
+
+
+def validate_tool_args(name: Any, args: Any) -> dict[str, Any]:
+  """Validates `name` against `HANDLERS` and `args` against its JSON Schema."""
+  if not isinstance(name, str) or name not in HANDLERS:
+    raise ValueError(f"unknown tool {name}")
+  if not isinstance(args, dict):
+    raise ValueError("arguments must be a JSON object")
+  schema = _TOOL_SCHEMAS[name]
+  props = schema.get("properties") or {}
+  required = schema.get("required") or []
+  unknown = set(args) - set(props)
+  if unknown:
+    raise ValueError(f"unknown argument(s): {', '.join(sorted(unknown))}")
+  missing = [k for k in required if k not in args]
+  if missing:
+    raise ValueError(f"missing required argument(s): {', '.join(missing)}")
+
+  cleaned: dict[str, Any] = {}
+  for key, val in args.items():
+    spec_type = (props.get(key) or {}).get("type")
+    if spec_type == "string":
+      allow_empty = key in ("content", "new_text")
+      cleaned[key] = _validate_str(key, val, allow_empty=allow_empty)
+      if key == "old_text" and not cleaned[key]:
+        raise ValueError("old_text must not be empty")
+    elif spec_type == "integer":
+      cleaned[key] = _validate_pos_int(key, val)
+    elif spec_type == "boolean":
+      cleaned[key] = _validate_bool(key, val)
+    else:
+      cleaned[key] = val
+  return cleaned
+
+
+def _audit_target(name: str, args: dict[str, Any]) -> str:
+  """Returns a safe redacted audit target summary without full payloads."""
+  if isinstance(args.get("path"), str):
+    return resolve(args["path"])
+  if isinstance(args.get("command"), str):
+    t = args.get("timeout_sec", taskbridge.MAX_TIMEOUT_SEC)
+    return f"timeout={t}s,cmd_bytes={len(args['command'].encode('utf-8', 'replace'))}"
+  return str(name)
+
+
+def _write_audit(
+    tool: str, target: str, status: str, started: float, detail: str = ""
+) -> None:
+  """Writes one structured JSON-line audit record to stderr under a lock."""
+  line = taskbridge.format_audit_record(
+      "task_mcp",
+      tool,
+      target,
+      status,
+      round((time.monotonic() - started) * 1000),
+      detail,
+      extra_secrets=_extra_secrets(),
+  )
+  with _err_lock:
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
+def _scrub_content(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """Redacts leaked secret substrings in MCP text blocks."""
+  extras = _extra_secrets()
+  out: list[dict[str, Any]] = []
+  for block in blocks:
+    if block.get("type") == "text" and isinstance(block.get("text"), str):
+      out.append({
+          **block,
+          "text": taskbridge.redact_secrets(
+              block["text"], extra_secrets=extras
+          ),
+      })
+    else:
+      out.append(block)
+  return out
 
 
 def send(message: dict[str, Any]) -> None:
@@ -412,26 +564,51 @@ def call(rid: Any, params: dict[str, Any]) -> None:
     rid: JSON-RPC request ID.
     params: Request `params` dictionary containing `name` and `arguments`.
   """
-  name, args = params.get("name"), params.get("arguments") or {}
+  started = time.monotonic()
+  name = params.get("name")
+  raw_args = params.get("arguments")
+  if raw_args is None and "arguments" not in params:
+    raw_args = {}
+  status, detail, target = "ok", "", str(name or "?")
   try:
-    if name not in HANDLERS:
-      raise ValueError(f"unknown tool {name}")
+    args = validate_tool_args(name, raw_args)
+    target = _audit_target(str(name), args)
+  except ValueError as exc:
+    status = "rejected"
+    detail = taskbridge.redact_secrets(str(exc), extra_secrets=_extra_secrets())
     send({
         "jsonrpc": "2.0",
         "id": rid,
-        "result": {"content": HANDLERS[name](**args), "isError": False},
+        "result": {"content": text(f"error: {detail}"), "isError": True},
+    })
+    _write_audit(str(name or "?"), target, status, started, detail)
+    return
+
+  try:
+    content = _scrub_content(HANDLERS[name](**args))
+    send({
+        "jsonrpc": "2.0",
+        "id": rid,
+        "result": {"content": content, "isError": False},
     })
   except Exception as exc:  # pylint: disable=broad-exception-caught
-    message = (
+    status = "error"
+    raw_message = (
         str(exc)
         if isinstance(exc, ValueError)
         else f"{type(exc).__name__}: {exc}"
     )
+    message = taskbridge.redact_secrets(
+        raw_message, extra_secrets=_extra_secrets()
+    )
+    detail = message
     send({
         "jsonrpc": "2.0",
         "id": rid,
         "result": {"content": text(f"error: {message}"), "isError": True},
     })
+  finally:
+    _write_audit(str(name), target, status, started, detail)
 
 
 def error(rid: Any, code: int, message: str) -> None:
@@ -487,7 +664,8 @@ def handle(pool: futures.ThreadPoolExecutor, req: Any) -> None:
 
 
 def main() -> None:
-  """Reads JSON-RPC lines from stdin and dispatches them until EOF."""
+  """Scrubs parent secrets, reads JSON-RPC lines from stdin, and dispatches."""
+  _scrub_process_env()
   pool = futures.ThreadPoolExecutor(4)
   for line in sys.stdin:
     if not line.strip():
