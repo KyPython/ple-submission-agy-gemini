@@ -1,0 +1,5 @@
+All deliverable and reference files inside the container have been updated and verified for non-emptiness, clean formatting, and valid syntax:
+
+- [`submission/model.ifc`](file:///app/files/frontier__DCBim__p6_002/submission/model.ifc) (`11,205` bytes): Complete IFC4 3D BIM model of the phased data-center campus (`DH_P1`, `DH_P2`, `SUB`, `CTP`, `GEN`, `BRM`, `RET`), with `IfcBuildingStorey` entities, `DCD_Layout` property sets, and the `DCD_Networks` JSON payload on `IfcSite` satisfying all 17 binding requirements (Phase 1 weighted utility cost $286.33 \le 314.0$; Full build-out weighted utility cost $372.82 \le 473.0$).
+- [`docs/ifc_contract.md`](file:///app/files/frontier__DCBim__p6_002/docs/ifc_contract.md) (`4,603` bytes): Verified non-empty Markdown with placeholder tokens replaced by concrete examples.
+- [`docs/example.ifc`](file:///app/files/frontier__DCBim__p6_002/docs/example.ifc) (`4,005` bytes): Verified non-empty STEP / `IFC4` reference file.

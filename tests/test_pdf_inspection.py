@@ -175,6 +175,16 @@ class PdfInspectionTests(unittest.TestCase):
           "out.write_bytes((b'\\x89PNG' + b'X' * (5_500_000)) if dpi >= 150 else small)\n"
       )
       fake_pdftoppm.chmod(fake_pdftoppm.stat().st_mode | stat.S_IEXEC)
+      # Stub pdfinfo too: a real /usr/bin/pdfinfo (poppler-utils) fails on this
+      # minimal %PDF- file (syntax error) and would make count_pages return
+      # corrupt_or_encrypted. The stub keeps page counting deterministic.
+      fake_pdfinfo = bin_dir / "pdfinfo"
+      fake_pdfinfo.write_text(
+          "#!/usr/bin/env python3\n"
+          "print('Title: Test')\n"
+          "print('Pages:           1')\n"
+      )
+      fake_pdfinfo.chmod(fake_pdfinfo.stat().st_mode | stat.S_IEXEC)
       cmd = task_mcp._build_pdf_render_command(str(pdf_path), "1")
       res = subprocess.run(
           ["bash", "-c", cmd],

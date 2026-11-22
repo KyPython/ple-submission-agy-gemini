@@ -1,0 +1,11 @@
+All deliverable files and helper scripts in the container have been verified to exist, be non-empty, and pass strict syntax and archive integrity checks (`python3 -W error -m py_compile` and `unzip -t`):
+
+- [`/filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/submission.zip`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/submission.zip) — Complete turnover archive containing:
+  1. [`flush_plan.csv`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/flush_plan.csv) (`52` stage rows across `C1`..`C8`)
+  2. [`chemistry_plan.csv`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/chemistry_plan.csv) (`46` dosing rows across `C1`..`C8`)
+  3. [`acceptance_matrix.csv`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/acceptance_matrix.csv) (`144` gate/parameter verification rows across `RINSE`, `PASSIVATION`, `DISCHARGE`, and `TURNOVER` gates)
+  4. [`schedule.csv`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/schedule.csv) (`12-hour`-shift-aligned and midnight-aligned schedule satisfying all milestones, cascade links, and utility water caps)
+  5. [`resources.json`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/resources.json) (`total_usd = $47,274.81`)
+  6. [`constraint_register.csv`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/constraint_register.csv) (`71` requirement rows citing only adopted governing documents)
+  7. [`MOP.md`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/MOP.md) (Method of Procedure, design basis with governing constraint and margin for `C1`..`C8`, resolution of document conflicts and defects, rejected/superseded documents, and `29 CFR 1910.1200` hazard communication safety plan)
+- [`/filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/build_submission.py`](file:///filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/build_submission.py) — Self-contained generator script verified free of syntax warnings or errors.

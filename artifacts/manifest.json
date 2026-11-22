@@ -1,0 +1,185 @@
+{
+  "format": 1,
+  "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+  "created": "2026-11-21T06:30:34Z",
+  "harness": {
+    "name": "agy-gemini",
+    "model_api": "google-cloud/gemini-4-argon",
+    "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+    "files": {
+      ".gitignore": "100644 af82b5cdd9c5791adba2ffbcdd373d69ff7429d6",
+      "AGENTS.md": "100644 ea6fc9cdd2f961b16fba23d0b2e9b1a286860700",
+      "LICENSE": "100644 261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+      "README.md": "100644 72160c4d1f28f2d85adc09b204f077737dc9c228",
+      "deliverable_gate.py": "100644 9e8323deeb54cdc9cf089509a6becafd5e12d29d",
+      "install.sh": "100755 7ed92a559a26464af14e8edd11d9bb8489c7d3a1",
+      "requirements.txt": "100644 7bc03d775075fc452cc88d8aa6292087dd8eec65",
+      "serve.py": "100644 884cf5b34b0c52d8242c64e8f5b0eec96e934ae8",
+      "specs/frontier-stage1-readiness/design.md": "100644 1465b9355a8363b49b96e9bd421cb034d548b367",
+      "specs/frontier-stage1-readiness/requirements.md": "100644 89a6c9e131ac56dcfb8a176a60028e4f4981d397",
+      "specs/frontier-stage1-readiness/tasks.md": "100644 ae798adb8f0d04271120951e0ac4a5e43de6492a",
+      "submission.yaml": "100644 fb055e2f5f4547abac23cc3a02df3a9f5ef12e76",
+      "task_mcp.py": "100644 5b121fb8178e1deadf4d10645ed4234615f0f92a",
+      "taskbridge.py": "100644 6f568bd1a010344e58addb12c50a0761a80374da",
+      "tests/__init__.py": "100644 58d482ea3866250ed5f1eb02fdf1da14377214c6",
+      "tests/test_deliverable_gate.py": "100644 8ad79a52748c278c852a3eb24de5f60d30fc1832",
+      "tests/test_pdf_inspection.py": "100644 3da1504dc23f35e05b8d19c2810223c31ea145b5",
+      "tests/test_permissions_boundary.py": "100644 f0d3ef5c11c270fb731c082b78e3d568473bf752",
+      "tests/test_stage1_packaging.py": "100644 a240fffcdae71efa75fabe8b357769526bf97766"
+    },
+    "commit": "945839ffdd0f2ada5ee900bef850d9432c31561e",
+    "dirty": true
+  },
+  "tasks": {
+    "cooling-water-flush-plan": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "cooling-water-flush-plan",
+      "trial": "cooling-water-flush-plan__QPv4HKo",
+      "ended": "ok",
+      "reward": 0.266667,
+      "tree": "2e1e830e284a4ac8fbe788124a1359652439bd4e87a426c2339ba07c1dcf562f",
+      "files": {
+        "filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/submission.zip": "19a0904a18b05a1b1c5074a9c8f5e0a1d34a05f3"
+      },
+      "final_message": "0feb6a2827336f7a9fe712f992537dc45a21227f",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-center-site-model": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "smoke-apex-20261120",
+      "trial": "data-center-site-model__i93cptp",
+      "ended": "ok",
+      "reward": 1.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {
+        "app/files/frontier__DCBim__p6_002/submission/model.ifc": "d56a8e07177ca74c735226e0c4b4b29dc2efb1e6"
+      },
+      "final_message": "df7b0450745d1408add449e8e9e30cf833c2d4fb",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-hall-device-takeoff": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "data-hall-device-takeoff",
+      "trial": "data-hall-device-takeoff__eGoLLXt",
+      "ended": "ok",
+      "reward": 0.243478,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {
+        "filesystem/final_batch4__electrical_task17_ec_0205_d100__blind/output/submission.zip": "f8037ca85ce853ff33c7db09fee6b0630f01bc41"
+      },
+      "final_message": "fc7bc32501cf20398c994eb9103588be9117b42e",
+      "deleted": [],
+      "skipped": []
+    },
+    "division-26-specifications": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "division-26-specifications",
+      "trial": "division-26-specifications__LnsfvvU",
+      "ended": "ok",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "623010e2032d9402a024d2b91b194eacb830e4c5",
+      "deleted": [],
+      "skipped": []
+    },
+    "frame-extension-method": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "frame-extension-method",
+      "trial": "frame-extension-method__nZqUFaJ",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "heat-rejection-life-cycle-cost": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "heat-rejection-life-cycle-cost",
+      "trial": "heat-rejection-life-cycle-cost__oR3o4EZ",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "mv-conveyance-study": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "mv-conveyance-study",
+      "trial": "mv-conveyance-study__zRENCY3",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "roof-deck-design": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "roof-deck-design",
+      "trial": "roof-deck-design__jSPZRBS",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "seismic-diaphragm-shear": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "seismic-diaphragm-shear",
+      "trial": "seismic-diaphragm-shear__JjbEdax",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "wind-diaphragm-shear": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "wind-diaphragm-shear",
+      "trial": "wind-diaphragm-shear__PgDHBk9",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "foundation-strategy": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "foundation-strategy",
+      "trial": "foundation-strategy__m9M3M5j",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    },
+    "lv-cable-sizing": {
+      "run": "lv-cable-sizing",
+      "trial": "lv-cable-sizing__XLscNzM",
+      "ended": "harness: NonZeroAgentExitCodeError",
+      "reward": 0.0,
+      "tree": "6d152a7041dae7c333803d9420cefaccb2ef21c3c85cf246db55c73f162881a9",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {},
+      "final_message": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "deleted": [],
+      "skipped": []
+    }
+  }
+}

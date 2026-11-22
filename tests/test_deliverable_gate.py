@@ -262,6 +262,87 @@ class DeliverableGateTests(unittest.TestCase):
         self.assertTrue(by_path[p]["error"])
       self.assertFalse(by_path[missing_target]["ok"])
 
+  def test_deep_zip_xlsx_and_fenced_markdown_json_validators(self) -> None:
+    """FRNT-5.2b: Deep .zip member checks, .xlsx workbook XML check, and Markdown fenced JSON checks."""
+    import io
+    with tempfile.TemporaryDirectory() as workdir:
+      root = pathlib.Path(workdir)
+      session = LocalContainerSession(workdir=workdir)
+
+      def make_xlsx_bytes(valid_xml: bool = True, include_wb: bool = True) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as xzf:
+          if include_wb:
+            body = "<workbook><sheets/></workbook>" if valid_xml else "<workbook><unclosed>"
+            xzf.writestr("xl/workbook.xml", body)
+          else:
+            xzf.writestr("docProps/core.xml", "<core/>")
+        return buf.getvalue()
+
+      (root / "ok.xlsx").write_bytes(make_xlsx_bytes(valid_xml=True, include_wb=True))
+      (root / "bad_missing_wb.xlsx").write_bytes(make_xlsx_bytes(valid_xml=True, include_wb=False))
+      (root / "bad_corrupt_xml.xlsx").write_bytes(make_xlsx_bytes(valid_xml=False, include_wb=True))
+
+      (root / "ok_basis.md").write_text(
+          "# Design Basis\n\n```json\n{\"governing_standards\": [\"UFC\"], \"rate_parameters\": {\"k\": 1}}\n```\n"
+      )
+      (root / "bad_basis.md").write_text(
+          "# Design Basis\n\n```json\n{\"governing_standards\": [\"UFC\",}\n```\n"
+      )
+
+      with zipfile.ZipFile(root / "ok_submission.zip", "w") as zf:
+        zf.writestr("issue_plan.csv", "sheet_id,action\nGI-001,REPLACE\n")
+        zf.writestr("resources.json", '{"programme_cost_usd": 42000.0}')
+        zf.writestr("design_basis.md", "# Basis\n```json\n{\"void_markups\": []}\n```\n")
+        zf.writestr("constraint_register.xlsx", make_xlsx_bytes(True, True))
+
+      with zipfile.ZipFile(root / "bad_zip_zero_member.zip", "w") as zf:
+        zf.writestr("issue_plan.csv", "")
+
+      with zipfile.ZipFile(root / "bad_zip_member_json.zip", "w") as zf:
+        zf.writestr("resources.json", "{broken_json")
+
+      with zipfile.ZipFile(root / "bad_zip_member_md.zip", "w") as zf:
+        zf.writestr("design_basis.md", "# Basis\n```json\n{bad: 1}\n```\n")
+
+      with zipfile.ZipFile(root / "bad_zip_member_xlsx.zip", "w") as zf:
+        zf.writestr("constraint_register.xlsx", make_xlsx_bytes(True, False))
+
+      candidates = [
+          str(root / name)
+          for name in (
+              "ok.xlsx",
+              "bad_missing_wb.xlsx",
+              "bad_corrupt_xml.xlsx",
+              "ok_basis.md",
+              "bad_basis.md",
+              "ok_submission.zip",
+              "bad_zip_zero_member.zip",
+              "bad_zip_member_json.zip",
+              "bad_zip_member_md.zip",
+              "bad_zip_member_xlsx.zip",
+          )
+      ]
+      report = asyncio.run(deliverable_gate.verify_deliverables(session, candidates))
+      by_path = {entry["path"]: entry for entry in report["checked"]}
+
+      for ok_name in ("ok.xlsx", "ok_basis.md", "ok_submission.zip"):
+        p = str(root / ok_name)
+        self.assertTrue(by_path[p]["ok"], f"expected ok for {ok_name}: {by_path[p]}")
+
+      for bad_name in (
+          "bad_missing_wb.xlsx",
+          "bad_corrupt_xml.xlsx",
+          "bad_basis.md",
+          "bad_zip_zero_member.zip",
+          "bad_zip_member_json.zip",
+          "bad_zip_member_md.zip",
+          "bad_zip_member_xlsx.zip",
+      ):
+        p = str(root / bad_name)
+        self.assertFalse(by_path[p]["ok"], f"expected failure for {bad_name}: {by_path[p]}")
+        self.assertTrue(by_path[p]["error"])
+
   def test_failed_gate_triggers_bounded_conversation_repair(self) -> None:
     """FRNT-5.3: Failed deliverables trigger agy --conversation repair within MAX_REPAIR_ATTEMPTS."""
     with tempfile.TemporaryDirectory() as workdir:

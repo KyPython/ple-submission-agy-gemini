@@ -137,10 +137,38 @@ print(json.dumps(out))
 """.strip()
 
 _CONTAINER_VERIFY_SCRIPT = """
-import ast, csv, json, os, sys, xml.etree.ElementTree as ET, zipfile, zlib
+import ast, csv, io, json, os, re, sys, xml.etree.ElementTree as ET, zipfile, zlib
 
 paths = json.loads(sys.argv[1])
 results = []
+_FENCED_JSON_RE = re.compile(
+    r"(?ms)^[ \\t]*```json[ \\t]*\\r?\\n(.*?)^[ \\t]*```[ \\t]*(?:\\r?\\n|$)"
+)
+_MAX_MEMBER_INSPECT_BYTES = 32 << 20
+
+def check_fenced_json(text, label):
+  for idx, match in enumerate(_FENCED_JSON_RE.finditer(text), start=1):
+    block = match.group(1).strip()
+    if not block:
+      raise ValueError(f"empty fenced json block #{idx} in {label}")
+    try:
+      json.loads(block)
+    except ValueError as exc:
+      raise ValueError(f"invalid fenced json block #{idx} in {label}: {exc}") from exc
+
+def check_csv_text(text, label):
+  rows = list(csv.reader(io.StringIO(text)))
+  if not any(any(cell.strip() for cell in row) for row in rows):
+    raise ValueError(f"CSV has no non-empty rows ({label})")
+
+def check_xlsx_zf(zf, label):
+  bad = zf.testzip()
+  if bad is not None:
+    raise zipfile.BadZipFile(f"corrupt xlsx member in {label}: {bad}")
+  names = set(zf.namelist())
+  if "xl/workbook.xml" not in names:
+    raise ValueError(f"xlsx missing xl/workbook.xml ({label})")
+  ET.fromstring(zf.read("xl/workbook.xml"))
 
 def check_one(path):
   checks = ["exists"]
@@ -162,6 +190,36 @@ def check_one(path):
         bad = zf.testzip()
         if bad is not None:
           return {"path": path, "size": size, "checks": checks, "ok": False, "error": f"corrupt zip member: {bad}"}
+        members = [
+            info for info in zf.infolist()
+            if not info.is_dir()
+            and not info.filename.startswith("__MACOSX/")
+            and os.path.basename(info.filename) != ".DS_Store"
+        ]
+        if not members:
+          return {"path": path, "size": size, "checks": checks, "ok": False, "error": "zip archive contains no files"}
+        for info in members:
+          mname = info.filename
+          if info.file_size <= 0:
+            return {"path": path, "size": size, "checks": checks, "ok": False, "error": f"zip member {mname} is 0 bytes"}
+          if info.file_size > _MAX_MEMBER_INSPECT_BYTES:
+            continue
+          mext = os.path.splitext(mname)[1].lower()
+          if mext == ".json":
+            json.loads(zf.read(info).decode("utf-8"))
+          elif mext == ".csv":
+            check_csv_text(zf.read(info).decode("utf-8-sig"), mname)
+          elif mext in (".xml", ".svg"):
+            ET.fromstring(zf.read(info))
+          elif mext == ".md":
+            check_fenced_json(zf.read(info).decode("utf-8"), mname)
+          elif mext == ".xlsx":
+            with zipfile.ZipFile(io.BytesIO(zf.read(info)), "r") as xzf:
+              check_xlsx_zf(xzf, mname)
+    elif ext == ".xlsx":
+      checks.append("xlsx")
+      with zipfile.ZipFile(path, "r") as xzf:
+        check_xlsx_zf(xzf, path)
     elif ext == ".json":
       checks.append("json")
       with open(path, "r", encoding="utf-8") as f:
@@ -169,12 +227,14 @@ def check_one(path):
     elif ext == ".csv":
       checks.append("csv")
       with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.reader(f))
-      if not any(any(cell.strip() for cell in row) for row in rows):
-        return {"path": path, "size": size, "checks": checks, "ok": False, "error": "CSV has no non-empty rows"}
+        check_csv_text(f.read(), path)
     elif ext in (".xml", ".svg"):
       checks.append("svg" if ext == ".svg" else "xml")
       ET.parse(path)
+    elif ext == ".md":
+      checks.append("md")
+      with open(path, "r", encoding="utf-8") as f:
+        check_fenced_json(f.read(), path)
     elif ext == ".py":
       checks.append("py")
       with open(path, "r", encoding="utf-8") as f:
