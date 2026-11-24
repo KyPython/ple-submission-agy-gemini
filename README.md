@@ -13,26 +13,15 @@ tools (`tools: []`) and exposes the task container via MCP instead.
 
 A lightweight stdio MCP server in `task_mcp.py` provides `shell`, `read_file`,
 `write_file`, and `edit_file` tools backed by the task container via
-`taskbridge.Relay` (`read_file` returns raster images as native MCP image blocks,
-renders `.pdf` / `%PDF-` engineering drawings in-container up to 5 pages per call
-with automatic DPI downscaling, and summarizes binary CAD metadata). Any task-provided MCP
+`taskbridge.Relay` (`read_file` returns image files as native MCP image blocks
+so Gemini can inspect engineering drawings directly). Any task-provided MCP
 servers (email, documents, CAD, etc.) are also proxied into the task container
-through `Relay.mcp_url`. Core bridge tools are registered eagerly while external
-task MCP catalogs are bounded by `AGY_MAX_EAGER_MCP_TOOLS` (default `8`) and
-allowlist/denylist filters, with remaining tools exposed via `call_mcp_tool`.
+through `Relay.mcp_url`. Every MCP server is registered with `"eager": true` in
+`mcp_config.json`, and `serve.py` pre-fetches each server's tool list before
+launching `agy` so the model sees all tool schemas immediately.
 
 `agy` reads `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL`, which the evaluator
-sets automatically for Gemini models (`modelProvider: "gemini"`). The custom
-agent prompt enforces `tools: []` in the serve container (plus `allowNonWorkspaceAccess: false`,
-`toolPermission: "strict"`, and `--sandbox`), a **Constraint Register** (separating hard
-feasibility gates from optimization objectives before designing), and a **Cross-File Reconciliation**
-check across tables, JSON ledgers, CAD/IFC files, and Markdown reports. After `agy`
-finishes, `deliverable_gate.py` discovers modified/output candidates in-container
-and runs `$0` structural checks (`.zip` archive and member checks, `.xlsx` `xl/workbook.xml`,
-`.json`, `.csv`, `.xml`/`.svg`, `.py` AST, `.pdf` header/EOF, and Markdown fenced-JSON blocks),
-triggering up to 2 bounded `--conversation` repair turns if any deliverable fails.
-
-The final text
+sets automatically for Gemini models (`modelProvider: "gemini"`). The final text
 response from `--output-format stream-json` becomes `final_message` (or the last
 streamed text block if the task times out first). If `agy` stalls with no output
 for 40 minutes, loses its connection before producing an answer, or hits a rate
@@ -43,11 +32,9 @@ limit (waiting `60s * attempt`), `serve.py` resumes the conversation with
 |---|---|
 | `submission.yaml` | Model declaration, build script, and server startup command |
 | `install.sh` | Downloads the pinned `agy` 1.4.10 binary (with SHA-512 verification) and creates the Python venv |
-| `serve.py` | Sets up an isolated `agy` home and MCP config per task, enforces policy, runs `agy` + verification gate |
-| `deliverable_gate.py` | Task-agnostic `$0` in-container deliverable discovery, syntax/archive validation, and repair prompt builder |
-| `task_mcp.py` | Stdio MCP server exposing `shell`, `read_file` (with PDF rendering), `write_file`, and `edit_file` in the task container |
-| `taskbridge.py` | Serve protocol, secret redaction, audit logging, and local HTTP relay |
-| `tests/` | Offline `$0` unit test suite (`32` tests covering boundary policy, PDF inspection, deliverable gate, and packaging) |
+| `serve.py` | Sets up an isolated `agy` home and MCP config per task, runs `agy`, and returns its output |
+| `task_mcp.py` | Stdio MCP server exposing `shell`, `read_file`, `write_file`, and `edit_file` in the task container |
+| `taskbridge.py` | Serve protocol and local HTTP relay (shared across Python samples) |
 
 ## Configuration
 
